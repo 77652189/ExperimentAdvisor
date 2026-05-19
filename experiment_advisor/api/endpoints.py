@@ -164,12 +164,11 @@ def get_next_trial() -> dict[str, Any]:
             space, _ = build_space()
     phase = state.get("phase", "doe")
     if phase == "doe" and int(state.get("completed_count", 0)) >= int(state.get("doe_batch_limit", 8)):
-        effect_report = analyze_effects(space)
-        if effect_report.get("ready_for_bayes"):
-            state = load_state()
-            state["phase"] = "bayes"
-            save_state(state)
-            phase = "bayes"
+        analyze_effects(space)
+        state = load_state()
+        state["phase"] = "bayes"
+        save_state(state)
+        phase = "bayes"
 
     if phase == "doe":
         design = load_design().get("design", [])

@@ -6,7 +6,7 @@ from typing import Any
 
 from experiment_advisor.bayes.constraint_handler import is_valid
 from experiment_advisor.bayes.initializer import build_ax_client, training_rows
-from experiment_advisor.bayes.scoring import primary_objective_for
+from experiment_advisor.bayes.scoring import OBJECTIVE_KEYS, primary_objective_for
 from experiment_advisor.data_access import load_state, load_trials
 
 
@@ -142,8 +142,7 @@ class ExperimentOptimizer:
     def _predict_ranges(self) -> dict[str, dict[str, Any]]:
         ranges: dict[str, dict[str, Any]] = {}
         trials = load_trials()
-        keys = ["yield", "cost", "duration"] if self.optimization_mode == "weighted_custom" else [self.primary_objective]
-        for key in keys:
+        for key in OBJECTIVE_KEYS:
             values = [float(trial["outcomes"][key]) for trial in trials if key in trial.get("outcomes", {})]
             if values:
                 low, high = min(values), max(values)

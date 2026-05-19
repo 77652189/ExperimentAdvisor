@@ -12,7 +12,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from experiment_advisor.api import endpoints
-from experiment_advisor.bayes.scoring import normalize_weights, required_outcomes
+from experiment_advisor.bayes import optimizer
+from experiment_advisor.bayes.scoring import normalize_weights, primary_objective_for, required_outcomes
 from experiment_advisor.config.config_manager import ConfigManager
 from experiment_advisor.config.space_merger import merge_space
 from experiment_advisor.data_access import load_design, load_pending, load_state, load_trials
@@ -21,6 +22,7 @@ from experiment_advisor.paths import PARAMETER_DEFAULTS_PATH
 from experiment_advisor.storage import read_json
 
 reload(design_generator)
+reload(optimizer)
 endpoints = reload(endpoints)
 complete_trial = endpoints.complete_trial
 get_next_trial = endpoints.get_next_trial
@@ -230,7 +232,7 @@ def _experiment_controls(variables: list[dict[str, Any]], mode: str, weights: di
     bayes_limit = state.get("bayes_trial_limit")
     bayes_label = f"{bayes_done}/{bayes_limit}" if bayes_limit is not None else f"{bayes_done}/不限"
     cols[2].metric("Bayes", bayes_label)
-    cols[3].metric("主目标", _objective_label(state.get("primary_objective", "yield")))
+    cols[3].metric("主目标", _objective_label(primary_objective_for(mode)))
 
     limit_col1, limit_col2 = st.columns(2)
     doe_batch_limit = int(
