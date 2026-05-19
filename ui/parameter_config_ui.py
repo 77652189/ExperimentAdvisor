@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 import streamlit as st
 
@@ -9,40 +10,226 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from experiment_advisor.api.endpoints import get_next_trial, initialize
-from experiment_advisor.bayes.scoring import normalize_weights
+from experiment_advisor.api.endpoints import complete_trial, get_next_trial, initialize
+from experiment_advisor.bayes.scoring import normalize_weights, required_outcomes
+from experiment_advisor.config.config_manager import ConfigManager
+from experiment_advisor.config.space_merger import merge_space
+from experiment_advisor.data_access import load_design, load_pending, load_state, load_trials
+from experiment_advisor.paths import PARAMETER_DEFAULTS_PATH
+from experiment_advisor.storage import read_json
+
+MODE_LABELS = {
+    "产量优先": "maximize_yield",
+    "成本优先": "minimize_cost",
+    "周期优先": "minimize_duration",
+    "自定义权重": "weighted_custom",
+}
+MODE_NAMES = {value: key for key, value in MODE_LABELS.items()}
 
 
-def _mode_from_label(label: str) -> str:
-    return {
-        "产量优先": "maximize_yield",
-        "成本优先": "minimize_cost",
-        "周期优先": "minimize_duration",
-        "自定义权重": "weighted_custom",
-    }[label]
+def _default_variables() -> list[dict[str, Any]]:
+    defaults = read_json(PARAMETER_DEFAULTS_PATH, {"variables": []})
+    return defaults.get("variables", [])
 
 
-st.set_page_config(page_title="ExperimentAdvisor", layout="wide")
-st.title("ExperimentAdvisor")
+def _ensure_form_state() -> None:
+    if "variables" not in st.session_state:
+        active = ConfigManager().get_active_config()
+        st.session_state.variables = active.get("variables", _default_variables()) if active else _default_variables()
+        st.session_state.optimization_mode = active.get("optimization_mode", "maximize_yield") if active else "maximize_yield"
+        st.session_state.objective_weights = active.get(
+            "objective_weights", {"yield": 1.0, "cost": 0.0, "duration": 0.0}
+        ) if active else {"yield": 1.0, "cost": 0.0, "duration": 0.0}
 
-mode_label = st.radio("优化模式", ["产量优先", "成本优先", "周期优先", "自定义权重"], horizontal=True)
-mode = _mode_from_label(mode_label)
 
-weights = None
-if mode == "weighted_custom":
+def _mode_index(mode: str) -> int:
+    labels = list(MODE_LABELS)
+    return labels.index(MODE_NAMES.get(mode, "产量优先"))
+
+
+def _variable_editor() -> list[dict[str, Any]]:
+    variables: list[dict[str, Any]] = []
+    for index, variable in enumerate(st.session_state.variables):
+        with st.container(border=True):
+            cols = st.columns([1.4, 1, 1, 1, 1, 1])
+            name = cols[0].text_input("变量名", value=variable.get("name", ""), key=f"name_{index}")
+            unit = cols[1].text_input("单位", value=variable.get("unit", ""), key=f"unit_{index}")
+            bounds = variable.get("bounds", [0.0, 1.0])
+            focus = variable.get("focus_range") or variable.get("focus") or bounds
+            lower = cols[2].number_input("下界", value=float(bounds[0]), key=f"lower_{index}")
+            upper = cols[3].number_input("上界", value=float(bounds[1]), key=f"upper_{index}")
+            focus_lower = cols[4].number_input("重点下界", value=float(focus[0]), key=f"focus_lower_{index}")
+            focus_upper = cols[5].number_input("重点上界", value=float(focus[1]), key=f"focus_upper_{index}")
+            if name:
+                variables.append(
+                    {
+                        "name": name.strip(),
+                        "unit": unit.strip(),
+                        "bounds": [lower, upper],
+                        "focus_range": [focus_lower, focus_upper],
+                    }
+                )
+    add_col, remove_col = st.columns([1, 5])
+    if add_col.button("添加变量", width="stretch"):
+        st.session_state.variables.append({"name": "", "unit": "", "bounds": [0.0, 1.0], "focus_range": [0.0, 1.0]})
+        st.rerun()
+    if remove_col.button("删除最后一个变量", disabled=not st.session_state.variables):
+        st.session_state.variables = st.session_state.variables[:-1]
+        st.rerun()
+    return variables
+
+
+def _optimization_controls() -> tuple[str, dict[str, float] | None]:
+    labels = list(MODE_LABELS)
+    label = st.radio("优化模式", labels, index=_mode_index(st.session_state.optimization_mode), horizontal=True)
+    mode = MODE_LABELS[label]
+    weights = None
+    if mode == "weighted_custom":
+        current = st.session_state.objective_weights
+        col1, col2, col3 = st.columns(3)
+        weights = {
+            "yield": col1.number_input("yield 权重", min_value=0.0, value=float(current.get("yield", 0.6))),
+            "cost": col2.number_input("cost 权重", min_value=0.0, value=float(current.get("cost", 0.2))),
+            "duration": col3.number_input("duration 权重", min_value=0.0, value=float(current.get("duration", 0.2))),
+        }
+        st.caption(f"归一化权重：{normalize_weights(weights, mode)}")
+    st.session_state.optimization_mode = mode
+    st.session_state.objective_weights = weights or normalize_weights(None, mode)
+    return mode, weights
+
+
+def _config_panel(variables: list[dict[str, Any]], mode: str, weights: dict[str, float] | None) -> None:
+    manager = ConfigManager()
+    configs = manager.list_configs()
+    names = [item["name"] for item in configs]
+    selected = st.selectbox("已保存配置", names, index=0 if names else None, placeholder="暂无配置")
     col1, col2, col3 = st.columns(3)
-    weights = {
-        "yield": col1.number_input("yield 权重", min_value=0.0, value=0.6),
-        "cost": col2.number_input("cost 权重", min_value=0.0, value=0.2),
-        "duration": col3.number_input("duration 权重", min_value=0.0, value=0.2),
-    }
-    st.caption(f"归一化权重：{normalize_weights(weights, mode)}")
+    if col1.button("加载", disabled=not selected, width="stretch"):
+        payload = manager.load_config(selected)
+        st.session_state.variables = payload.get("variables", _default_variables())
+        st.session_state.optimization_mode = payload.get("optimization_mode", "maximize_yield")
+        st.session_state.objective_weights = payload.get(
+            "objective_weights", {"yield": 1.0, "cost": 0.0, "duration": 0.0}
+        )
+        st.rerun()
+    if col2.button("设为默认", disabled=not selected, width="stretch"):
+        manager.set_default(selected)
+        st.success(f"已设为默认：{selected}")
+    if col3.button("删除", disabled=not selected, width="stretch"):
+        manager.delete_config(selected)
+        st.success(f"已删除：{selected}")
+        st.rerun()
 
-if st.button("初始化 DOE"):
-    st.session_state["design"] = initialize(optimization_mode=mode, objective_weights=weights)
+    config_name = st.text_input("配置名称", placeholder="例如：高流速验证方案")
+    save_col, default_col = st.columns(2)
+    if save_col.button("保存配置", width="stretch"):
+        manager.save_config(config_name, variables, mode, normalize_weights(weights, mode))
+        st.success("配置已保存")
+    if default_col.button("设为默认并保存", width="stretch"):
+        manager.save_config(config_name, variables, mode, normalize_weights(weights, mode), is_default=True)
+        manager.set_default(config_name)
+        st.success("默认配置已保存")
 
-if "design" in st.session_state:
-    st.dataframe(st.session_state["design"])
 
-if st.button("获取下一批建议"):
-    st.json(get_next_trial())
+def _source_preview(variables: list[dict[str, Any]]) -> None:
+    defaults = read_json(PARAMETER_DEFAULTS_PATH, {"variables": []})
+    researcher_config = {"variables": variables}
+    try:
+        _, merge_log = merge_space(defaults, None, researcher_config)
+    except ValueError as exc:
+        st.warning(str(exc))
+        return
+    st.write("参数来源预览")
+    st.json(merge_log)
+
+
+def _experiment_controls(variables: list[dict[str, Any]], mode: str, weights: dict[str, float] | None) -> None:
+    state = load_state()
+    st.subheader("实验流程")
+    cols = st.columns(4)
+    cols[0].metric("阶段", state.get("phase", "doe"))
+    cols[1].metric("已完成", state.get("completed_count", 0))
+    cols[2].metric("DOE下标", state.get("next_doe_index", 0))
+    cols[3].metric("主目标", state.get("primary_objective", "yield"))
+
+    init_col, next_col = st.columns(2)
+    if init_col.button("初始化 DOE", type="primary", width="stretch"):
+        design = initialize(
+            researcher_config={"variables": variables},
+            optimization_mode=mode,
+            objective_weights=weights,
+        )
+        st.session_state.latest_design = design
+        st.success("DOE 已初始化")
+        st.rerun()
+    if next_col.button("获取下一批建议", width="stretch"):
+        st.session_state.latest_trial = get_next_trial()
+        st.rerun()
+
+    pending = load_pending()
+    if pending:
+        trial = pending[0]
+        st.info(f"当前待执行 trial：{trial['trial_index']}（{trial['phase']}）")
+        st.json(trial)
+        with st.form("complete_trial_form"):
+            st.write("录入实验结果")
+            current_state = load_state()
+            needed = required_outcomes(
+                current_state.get("optimization_mode", "maximize_yield"),
+                current_state.get("objective_weights", {"yield": 1.0}),
+            )
+            outcomes = {}
+            for key in needed:
+                outcomes[key] = st.number_input(key, value=0.0, key=f"outcome_{key}")
+            notes = st.text_area("备注", "")
+            submitted = st.form_submit_button("提交结果")
+            if submitted:
+                complete_trial(trial["trial_index"], outcomes, notes)
+                st.success("实验结果已录入")
+                st.rerun()
+    else:
+        st.caption("当前没有待执行 trial。")
+
+
+def _data_views() -> None:
+    tab_design, tab_trials, tab_state = st.tabs(["DOE矩阵", "实验结果", "状态"])
+    with tab_design:
+        design = load_design().get("design", [])
+        rows = [{"batch_index": item["batch_index"], **item["parameters"]} for item in design]
+        st.dataframe(rows, width="stretch")
+    with tab_trials:
+        trials = load_trials()
+        rows = [
+            {
+                "trial_index": item["trial_index"],
+                "phase": item["phase"],
+                **item.get("parameters", {}),
+                **{f"outcome_{key}": value for key, value in item.get("outcomes", {}).items()},
+                "notes": item.get("notes", ""),
+            }
+            for item in trials
+        ]
+        st.dataframe(rows, width="stretch")
+    with tab_state:
+        st.json(load_state())
+
+
+def main() -> None:
+    st.set_page_config(page_title="ExperimentAdvisor", layout="wide")
+    _ensure_form_state()
+    st.title("ExperimentAdvisor")
+
+    left, right = st.columns([1.15, 1])
+    with left:
+        st.subheader("参数配置")
+        mode, weights = _optimization_controls()
+        variables = _variable_editor()
+        _source_preview(variables)
+        _config_panel(variables, mode, weights)
+    with right:
+        _experiment_controls(variables, mode, weights)
+        _data_views()
+
+
+if __name__ == "__main__":
+    main()
