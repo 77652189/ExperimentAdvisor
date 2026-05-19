@@ -13,4 +13,5 @@ def test_end_to_end_yield_workflow():
     next_trial = get_next_trial()
     assert next_trial["phase"] == "bayes"
     assert "parameters" in next_trial
+    assert next_trial["parameters"] != trial["parameters"]
     assert load_state()["phase"] == "bayes"

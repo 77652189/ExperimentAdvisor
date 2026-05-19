@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import random
 from typing import Any
 
 from experiment_advisor.bayes.constraint_handler import is_valid
@@ -22,6 +24,10 @@ def _best_trial_for(primary: str) -> dict[str, Any] | None:
         if trial.get("trial_index") == best.get("trial_index"):
             return trial
     return None
+
+
+def _signature(params: dict[str, float]) -> tuple[tuple[str, float], ...]:
+    return tuple(sorted((name, round(float(value), 6)) for name, value in params.items()))
 
 
 class ExperimentOptimizer:
@@ -54,18 +60,50 @@ class ExperimentOptimizer:
     def _fallback_candidate(self) -> dict[str, float]:
         fixed = self._fixed_values()
         best_trial = _best_trial_for(self.primary_objective)
-        candidate: dict[str, float] = {}
-        for name, item in self.space.items():
-            if name in fixed:
-                candidate[name] = fixed[name]
-            elif best_trial and name in best_trial.get("parameters", {}):
-                candidate[name] = float(best_trial["parameters"][name])
-            else:
-                candidate[name] = _center(item)
-        if is_valid(candidate, self.constraints):
+        trials = load_trials()
+        next_index = max([trial.get("trial_index", -1) for trial in trials] + [-1]) + 1
+        seen = {_signature(trial.get("parameters", {})) for trial in trials}
+        base = {
+            name: float(best_trial.get("parameters", {}).get(name, _center(item))) if best_trial else _center(item)
+            for name, item in self.space.items()
+        }
+
+        # Ax may be unavailable in a lightweight install. In that case, keep the
+        # advisor useful by exploring near the current best point instead of
+        # recommending the exact same parameters forever.
+        variable_names = [name for name in self.space if name not in fixed]
+        for attempt in range(30):
+            rng = random.Random(next_index * 997 + attempt * 37)
+            candidate: dict[str, float] = {}
+            for name, item in self.space.items():
+                if name in fixed:
+                    candidate[name] = fixed[name]
+                    continue
+                focus_lower, focus_upper = item.get("focus") or item["bounds"]
+                span = float(focus_upper) - float(focus_lower)
+                if span <= 0:
+                    candidate[name] = round(float(focus_lower), 6)
+                    continue
+                # Shrink slowly as data grows, but keep a minimum movement so
+                # repeated Bayes trials continue to probe the local region.
+                radius = max(span * 0.08, span * (0.35 / math.sqrt(max(len(trials), 1))))
+                direction = -1 if (attempt + next_index + len(name)) % 2 else 1
+                jitter = direction * radius * (0.35 + 0.65 * rng.random())
+                value = min(float(focus_upper), max(float(focus_lower), base[name] + jitter))
+                candidate[name] = round(value, 6)
+            if not variable_names:
+                candidate = dict(base)
+                candidate.update(fixed)
+            sig = _signature(candidate)
+            if sig not in seen and is_valid(candidate, self.constraints):
+                return candidate
+
+        candidate = dict(base)
+        candidate.update(fixed)
+        if _signature(candidate) not in seen and is_valid(candidate, self.constraints):
             return candidate
         center = {name: _center(item) for name, item in self.space.items()}
-        if is_valid(center, self.constraints):
+        if _signature(center) not in seen and is_valid(center, self.constraints):
             return center
         raise ValueError("no valid bayesian candidate found")
 
@@ -80,7 +118,8 @@ class ExperimentOptimizer:
                 return None
             candidate = {name: float(value) for name, value in params.items()}
             candidate.update(self._fixed_values())
-            if is_valid(candidate, self.constraints):
+            seen = {_signature(trial.get("parameters", {})) for trial in load_trials()}
+            if _signature(candidate) not in seen and is_valid(candidate, self.constraints):
                 return candidate
         return None
 
