@@ -40,6 +40,8 @@ def _ensure_form_state() -> None:
         st.session_state.objective_weights = active.get(
             "objective_weights", {"yield": 1.0, "cost": 0.0, "duration": 0.0}
         ) if active else {"yield": 1.0, "cost": 0.0, "duration": 0.0}
+        st.session_state.doe_batch_limit = 8
+        st.session_state.bayes_trial_limit = 0
 
 
 def _mode_index(mode: str) -> int:
@@ -196,12 +198,40 @@ def _recommendation_card(trial: dict[str, Any]) -> None:
 
 def _experiment_controls(variables: list[dict[str, Any]], mode: str, weights: dict[str, float] | None) -> None:
     state = load_state()
+    trials = load_trials()
+    doe_done = len([trial for trial in trials if trial.get("phase") == "doe"])
+    bayes_done = len([trial for trial in trials if trial.get("phase") == "bayes"])
     st.subheader("实验流程")
     cols = st.columns(4)
     cols[0].metric("阶段", state.get("phase", "doe"))
-    cols[1].metric("已完成", state.get("completed_count", 0))
-    cols[2].metric("DOE下标", state.get("next_doe_index", 0))
+    cols[1].metric("DOE", f"{doe_done}/{state.get('doe_batch_limit', 8)}")
+    bayes_limit = state.get("bayes_trial_limit")
+    bayes_label = f"{bayes_done}/{bayes_limit}" if bayes_limit is not None else f"{bayes_done}/不限"
+    cols[2].metric("Bayes", bayes_label)
     cols[3].metric("主目标", state.get("primary_objective", "yield"))
+
+    limit_col1, limit_col2 = st.columns(2)
+    doe_batch_limit = int(
+        limit_col1.number_input(
+            "DOE批次数",
+            min_value=1,
+            max_value=100,
+            value=int(st.session_state.get("doe_batch_limit", state.get("doe_batch_limit", 8))),
+            step=1,
+        )
+    )
+    bayes_trial_limit_raw = int(
+        limit_col2.number_input(
+            "Bayes批次数上限（0表示不限）",
+            min_value=0,
+            max_value=500,
+            value=int(st.session_state.get("bayes_trial_limit", state.get("bayes_trial_limit") or 0)),
+            step=1,
+        )
+    )
+    st.session_state.doe_batch_limit = doe_batch_limit
+    st.session_state.bayes_trial_limit = bayes_trial_limit_raw
+    bayes_trial_limit = None if bayes_trial_limit_raw == 0 else bayes_trial_limit_raw
 
     init_col, next_col = st.columns(2)
     if init_col.button("初始化 DOE", type="primary", width="stretch"):
@@ -209,13 +239,18 @@ def _experiment_controls(variables: list[dict[str, Any]], mode: str, weights: di
             researcher_config={"variables": variables},
             optimization_mode=mode,
             objective_weights=weights,
+            doe_batch_limit=doe_batch_limit,
+            bayes_trial_limit=bayes_trial_limit,
         )
         st.session_state.latest_design = design
         st.success("DOE 已初始化")
         st.rerun()
     if next_col.button("获取下一批建议", width="stretch"):
-        st.session_state.latest_trial = get_next_trial()
-        st.rerun()
+        try:
+            st.session_state.latest_trial = get_next_trial()
+            st.rerun()
+        except ValueError as exc:
+            st.warning(str(exc))
 
     pending = load_pending()
     if pending:
@@ -262,11 +297,16 @@ def _data_views() -> None:
         st.dataframe(rows, width="stretch")
     with tab_state:
         state = load_state()
-        cols = st.columns(4)
+        trials = load_trials()
+        doe_done = len([trial for trial in trials if trial.get("phase") == "doe"])
+        bayes_done = len([trial for trial in trials if trial.get("phase") == "bayes"])
+        cols = st.columns(5)
         cols[0].metric("阶段", state.get("phase", "doe"))
-        cols[1].metric("已完成", state.get("completed_count", 0))
-        cols[2].metric("下一DOE", state.get("next_doe_index", 0))
-        cols[3].metric("主目标", state.get("primary_objective", "yield"))
+        cols[1].metric("DOE", f"{doe_done}/{state.get('doe_batch_limit', 8)}")
+        bayes_limit = state.get("bayes_trial_limit")
+        cols[2].metric("Bayes", f"{bayes_done}/{bayes_limit}" if bayes_limit is not None else f"{bayes_done}/不限")
+        cols[3].metric("下一DOE", state.get("next_doe_index", 0))
+        cols[4].metric("主目标", state.get("primary_objective", "yield"))
         if state.get("best_outcomes"):
             st.write("历史最优")
             st.dataframe(_best_rows(state["best_outcomes"]), width="stretch", hide_index=True)

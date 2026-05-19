@@ -1,3 +1,5 @@
+import pytest
+
 from experiment_advisor import complete_trial, get_next_trial, initialize
 from experiment_advisor.data_access import load_state, save_design, save_pending, save_state, save_trials
 
@@ -72,3 +74,25 @@ def test_bayes_recovers_variable_space_from_existing_doe_design():
     next_trial = get_next_trial()
     assert set(next_trial["parameters"]) == {"x", "y", "PH"}
     assert set(load_state()["space"]) == {"x", "y", "PH"}
+
+
+def test_custom_doe_batch_limit_switches_after_configured_count():
+    design = initialize(doe_batch_limit=3)
+    assert len(design) == 3
+    for index in range(3):
+        trial = get_next_trial()
+        assert trial["phase"] == "doe"
+        complete_trial(trial["trial_index"], {"yield": 80 + index})
+    assert get_next_trial()["phase"] == "bayes"
+
+
+def test_bayes_trial_limit_stops_recommendations():
+    initialize(doe_batch_limit=2, bayes_trial_limit=1)
+    for index in range(2):
+        trial = get_next_trial()
+        complete_trial(trial["trial_index"], {"yield": 80 + index})
+    bayes_trial = get_next_trial()
+    assert bayes_trial["phase"] == "bayes"
+    complete_trial(bayes_trial["trial_index"], {"yield": 90})
+    with pytest.raises(ValueError, match="Bayes trial limit reached"):
+        get_next_trial()
