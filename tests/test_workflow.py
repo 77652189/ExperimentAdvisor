@@ -128,6 +128,14 @@ def test_cost_mode_records_cost_as_primary_objective():
     assert state["best_outcomes"]["cost"]["value"] == 1.2
 
 
+def test_bayes_prediction_ranges_include_all_outcomes_for_cost_mode():
+    initialize(optimization_mode="minimize_cost", doe_batch_limit=1)
+    trial = get_next_trial()
+    complete_trial(trial["trial_index"], {"yield": 10, "cost": 1.2, "duration": 48})
+    next_trial = get_next_trial()
+    assert set(next_trial["predicted_outcomes"]) == {"yield", "cost", "duration"}
+
+
 def test_duration_mode_records_duration_as_primary_objective():
     initialize(optimization_mode="minimize_duration", doe_batch_limit=1)
     trial = get_next_trial()
