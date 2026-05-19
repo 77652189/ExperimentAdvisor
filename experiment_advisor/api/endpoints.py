@@ -57,6 +57,7 @@ def initialize(
             "optimization_mode": optimization_mode,
             "primary_objective": primary,
             "objective_weights": weights,
+            "space": space,
             "effect_report": None,
             "best_outcomes": {},
             "initialized_at": now,
@@ -124,7 +125,9 @@ def get_next_trial() -> dict[str, Any]:
         return _pending_response(pending[0])
 
     state = load_state()
-    space, _ = build_space()
+    space = state.get("space")
+    if not space:
+        space, _ = build_space()
     phase = state.get("phase", "doe")
     if phase == "doe" and int(state.get("completed_count", 0)) >= int(state.get("doe_batch_limit", 8)):
         effect_report = analyze_effects(space)
