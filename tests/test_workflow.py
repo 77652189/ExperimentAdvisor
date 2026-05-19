@@ -1,5 +1,5 @@
 from experiment_advisor import complete_trial, get_next_trial, initialize
-from experiment_advisor.data_access import load_state
+from experiment_advisor.data_access import load_state, save_design, save_pending, save_state, save_trials
 
 
 def _three_variable_config():
@@ -36,3 +36,39 @@ def test_bayes_keeps_initialized_variable_space():
     next_trial = get_next_trial()
     assert next_trial["phase"] == "bayes"
     assert set(next_trial["parameters"]) == {"lactose_flow", "temperature", "ph"}
+
+
+def test_bayes_recovers_variable_space_from_existing_doe_design():
+    save_design(
+        2,
+        [
+            {"batch_index": 0, "phase": "doe", "parameters": {"x": 1.0, "y": 10.0, "PH": 7.0}, "warnings": []},
+            {"batch_index": 1, "phase": "doe", "parameters": {"x": 2.0, "y": 20.0, "PH": 8.0}, "warnings": []},
+        ],
+    )
+    save_trials(
+        [
+            {"trial_index": 0, "phase": "doe", "parameters": {"x": 1.0, "y": 10.0, "PH": 7.0}, "outcomes": {"yield": 1.0}},
+            {"trial_index": 1, "phase": "doe", "parameters": {"x": 2.0, "y": 20.0, "PH": 8.0}, "outcomes": {"yield": 2.0}},
+        ]
+    )
+    save_pending([])
+    save_state(
+        {
+            "phase": "bayes",
+            "doe_batch_limit": 2,
+            "completed_count": 2,
+            "next_doe_index": 2,
+            "optimization_mode": "maximize_yield",
+            "primary_objective": "yield",
+            "objective_weights": {"yield": 1.0, "cost": 0.0, "duration": 0.0},
+            "effect_report": None,
+            "best_outcomes": {"yield": {"value": 2.0, "trial_index": 1}},
+            "initialized_at": None,
+            "last_updated": None,
+        }
+    )
+    assert "space" not in load_state()
+    next_trial = get_next_trial()
+    assert set(next_trial["parameters"]) == {"x", "y", "PH"}
+    assert set(load_state()["space"]) == {"x", "y", "PH"}
