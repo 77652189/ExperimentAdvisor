@@ -16,9 +16,11 @@ from experiment_advisor.bayes.scoring import normalize_weights, required_outcome
 from experiment_advisor.config.config_manager import ConfigManager
 from experiment_advisor.config.space_merger import merge_space
 from experiment_advisor.data_access import load_design, load_pending, load_state, load_trials
+from experiment_advisor.doe import design_generator
 from experiment_advisor.paths import PARAMETER_DEFAULTS_PATH
 from experiment_advisor.storage import read_json
 
+reload(design_generator)
 endpoints = reload(endpoints)
 complete_trial = endpoints.complete_trial
 get_next_trial = endpoints.get_next_trial
