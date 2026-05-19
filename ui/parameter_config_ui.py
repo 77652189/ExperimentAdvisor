@@ -314,21 +314,55 @@ def _data_views() -> None:
             st.json(state)
 
 
+def _configuration_page() -> None:
+    st.header("参数配置")
+    mode, weights = _optimization_controls()
+    variables = _variable_editor()
+    _source_preview(variables)
+    _config_panel(variables, mode, weights)
+
+
+def _workflow_page() -> None:
+    st.header("实验流程")
+    mode = st.session_state.optimization_mode
+    weights = st.session_state.objective_weights if mode == "weighted_custom" else None
+    variables = [
+        variable
+        for variable in st.session_state.variables
+        if variable.get("name")
+    ]
+    if not variables:
+        st.warning("请先在“参数配置”菜单中至少配置一个变量。")
+        return
+    with st.expander("当前使用的参数配置", expanded=False):
+        st.write(f"优化模式：{MODE_NAMES.get(mode, mode)}")
+        st.dataframe(
+            [
+                {
+                    "变量": item.get("name"),
+                    "单位": item.get("unit", ""),
+                    "范围": f"{item.get('bounds', ['', ''])[0]} ~ {item.get('bounds', ['', ''])[1]}",
+                    "重点区间": f"{item.get('focus_range', ['', ''])[0]} ~ {item.get('focus_range', ['', ''])[1]}",
+                }
+                for item in variables
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+    _experiment_controls(variables, mode, weights)
+    _data_views()
+
+
 def main() -> None:
     st.set_page_config(page_title="ExperimentAdvisor", layout="wide")
     _ensure_form_state()
-    st.title("ExperimentAdvisor")
-
-    left, right = st.columns([1.15, 1])
-    with left:
-        st.subheader("参数配置")
-        mode, weights = _optimization_controls()
-        variables = _variable_editor()
-        _source_preview(variables)
-        _config_panel(variables, mode, weights)
-    with right:
-        _experiment_controls(variables, mode, weights)
-        _data_views()
+    st.sidebar.title("ExperimentAdvisor")
+    page = st.sidebar.radio("菜单", ["参数配置", "实验流程"], label_visibility="collapsed")
+    st.title(page)
+    if page == "参数配置":
+        _configuration_page()
+    else:
+        _workflow_page()
 
 
 if __name__ == "__main__":
