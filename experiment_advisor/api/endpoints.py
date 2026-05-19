@@ -36,6 +36,28 @@ def _as_dataframe(rows: list[dict[str, Any]]):
         return flattened
 
 
+def _space_from_design() -> dict[str, dict[str, Any]]:
+    design = load_design().get("design", [])
+    values: dict[str, list[float]] = {}
+    for row in design:
+        for name, value in row.get("parameters", {}).items():
+            if value is not None:
+                values.setdefault(name, []).append(float(value))
+    space: dict[str, dict[str, Any]] = {}
+    for name, series in values.items():
+        lower, upper = min(series), max(series)
+        if lower == upper:
+            lower -= 0.5
+            upper += 0.5
+        padding = (upper - lower) * 0.15
+        space[name] = {
+            "bounds": [round(lower - padding, 6), round(upper + padding, 6)],
+            "focus": [round(lower, 6), round(upper, 6)],
+            "unit": "",
+        }
+    return space
+
+
 def initialize(
     researcher_config: dict | None = None,
     optimization_mode: str = "maximize_yield",
@@ -127,7 +149,12 @@ def get_next_trial() -> dict[str, Any]:
     state = load_state()
     space = state.get("space")
     if not space:
-        space, _ = build_space()
+        space = _space_from_design()
+        if space:
+            state["space"] = space
+            save_state(state)
+        else:
+            space, _ = build_space()
     phase = state.get("phase", "doe")
     if phase == "doe" and int(state.get("completed_count", 0)) >= int(state.get("doe_batch_limit", 8)):
         effect_report = analyze_effects(space)
