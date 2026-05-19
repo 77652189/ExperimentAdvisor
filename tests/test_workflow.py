@@ -96,6 +96,17 @@ def test_custom_doe_batch_limit_switches_after_configured_count():
     assert get_next_trial()["phase"] == "bayes"
 
 
+def test_zero_doe_batch_limit_starts_with_bayes():
+    design = initialize(doe_batch_limit=0)
+    assert len(design) == 0
+    state = load_state()
+    assert state["phase"] == "bayes"
+    assert state["doe_batch_limit"] == 0
+    trial = get_next_trial()
+    assert trial["phase"] == "bayes"
+    assert "parameters" in trial
+
+
 def test_bayes_trial_limit_stops_recommendations():
     initialize(doe_batch_limit=2, bayes_trial_limit=1)
     for index in range(2):

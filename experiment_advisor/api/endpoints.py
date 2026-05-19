@@ -65,8 +65,8 @@ def initialize(
     doe_batch_limit: int = 8,
     bayes_trial_limit: int | None = None,
 ):
-    if doe_batch_limit <= 0:
-        raise ValueError("doe_batch_limit must be > 0")
+    if doe_batch_limit < 0:
+        raise ValueError("doe_batch_limit cannot be negative")
     if bayes_trial_limit is not None and bayes_trial_limit < 0:
         raise ValueError("bayes_trial_limit cannot be negative")
     weights = normalize_weights(objective_weights, optimization_mode)
@@ -78,7 +78,7 @@ def initialize(
     save_pending([])
     save_state(
         {
-            "phase": "doe",
+            "phase": "bayes" if len(design) == 0 else "doe",
             "doe_batch_limit": len(design),
             "bayes_trial_limit": bayes_trial_limit,
             "completed_count": 0,
