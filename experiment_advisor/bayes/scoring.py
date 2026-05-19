@@ -33,13 +33,7 @@ def primary_objective_for(mode: str) -> str:
 
 
 def required_outcomes(mode: str, weights: dict[str, float]) -> list[str]:
-    if mode == "maximize_yield":
-        return ["yield"]
-    if mode == "minimize_cost":
-        return ["cost"]
-    if mode == "minimize_duration":
-        return ["duration"]
-    return [key for key, value in weights.items() if value > 0]
+    return list(OBJECTIVE_KEYS)
 
 
 def _range_for(trials: list[dict[str, Any]], key: str) -> tuple[float, float] | None:

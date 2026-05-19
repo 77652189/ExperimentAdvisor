@@ -21,7 +21,7 @@ def test_end_to_end_yield_workflow():
         trial = get_next_trial()
         assert trial["phase"] == "doe"
         assert trial["trial_index"] == index
-        complete_trial(trial["trial_index"], {"yield": 80 + index})
+        complete_trial(trial["trial_index"], {"yield": 80 + index, "cost": 1 + index, "duration": 40 + index})
     next_trial = get_next_trial()
     assert next_trial["phase"] == "bayes"
     assert "parameters" in next_trial
@@ -34,7 +34,7 @@ def test_bayes_keeps_initialized_variable_space():
     for index in range(8):
         trial = get_next_trial()
         assert set(trial["parameters"]) == {"lactose_flow", "temperature", "ph"}
-        complete_trial(trial["trial_index"], {"yield": 80 + index})
+        complete_trial(trial["trial_index"], {"yield": 80 + index, "cost": 1 + index, "duration": 40 + index})
     next_trial = get_next_trial()
     assert next_trial["phase"] == "bayes"
     assert set(next_trial["parameters"]) == {"lactose_flow", "temperature", "ph"}
@@ -50,8 +50,18 @@ def test_bayes_recovers_variable_space_from_existing_doe_design():
     )
     save_trials(
         [
-            {"trial_index": 0, "phase": "doe", "parameters": {"x": 1.0, "y": 10.0, "PH": 7.0}, "outcomes": {"yield": 1.0}},
-            {"trial_index": 1, "phase": "doe", "parameters": {"x": 2.0, "y": 20.0, "PH": 8.0}, "outcomes": {"yield": 2.0}},
+            {
+                "trial_index": 0,
+                "phase": "doe",
+                "parameters": {"x": 1.0, "y": 10.0, "PH": 7.0},
+                "outcomes": {"yield": 1.0, "cost": 2.0, "duration": 3.0},
+            },
+            {
+                "trial_index": 1,
+                "phase": "doe",
+                "parameters": {"x": 2.0, "y": 20.0, "PH": 8.0},
+                "outcomes": {"yield": 2.0, "cost": 1.0, "duration": 2.0},
+            },
         ]
     )
     save_pending([])
@@ -82,7 +92,7 @@ def test_custom_doe_batch_limit_switches_after_configured_count():
     for index in range(3):
         trial = get_next_trial()
         assert trial["phase"] == "doe"
-        complete_trial(trial["trial_index"], {"yield": 80 + index})
+        complete_trial(trial["trial_index"], {"yield": 80 + index, "cost": 1 + index, "duration": 40 + index})
     assert get_next_trial()["phase"] == "bayes"
 
 
@@ -90,10 +100,10 @@ def test_bayes_trial_limit_stops_recommendations():
     initialize(doe_batch_limit=2, bayes_trial_limit=1)
     for index in range(2):
         trial = get_next_trial()
-        complete_trial(trial["trial_index"], {"yield": 80 + index})
+        complete_trial(trial["trial_index"], {"yield": 80 + index, "cost": 1 + index, "duration": 40 + index})
     bayes_trial = get_next_trial()
     assert bayes_trial["phase"] == "bayes"
-    complete_trial(bayes_trial["trial_index"], {"yield": 90})
+    complete_trial(bayes_trial["trial_index"], {"yield": 90, "cost": 0.5, "duration": 30})
     with pytest.raises(ValueError, match="Bayes trial limit reached"):
         get_next_trial()
 
@@ -101,7 +111,7 @@ def test_bayes_trial_limit_stops_recommendations():
 def test_cost_mode_records_cost_as_primary_objective():
     initialize(optimization_mode="minimize_cost", doe_batch_limit=1)
     trial = get_next_trial()
-    complete_trial(trial["trial_index"], {"cost": 1.2})
+    complete_trial(trial["trial_index"], {"yield": 10, "cost": 1.2, "duration": 48})
     state = load_state()
     assert state["primary_objective"] == "cost"
     assert state["best_outcomes"]["cost"]["value"] == 1.2
@@ -110,18 +120,18 @@ def test_cost_mode_records_cost_as_primary_objective():
 def test_duration_mode_records_duration_as_primary_objective():
     initialize(optimization_mode="minimize_duration", doe_batch_limit=1)
     trial = get_next_trial()
-    complete_trial(trial["trial_index"], {"duration": 48})
+    complete_trial(trial["trial_index"], {"yield": 10, "cost": 1.2, "duration": 48})
     state = load_state()
     assert state["primary_objective"] == "duration"
     assert state["best_outcomes"]["duration"]["value"] == 48
 
 
-def test_weighted_mode_requires_selected_weighted_outcomes():
+def test_all_modes_require_complete_outcomes():
     initialize(
         optimization_mode="weighted_custom",
         objective_weights={"yield": 0.7, "cost": 0.3, "duration": 0.0},
         doe_batch_limit=1,
     )
     trial = get_next_trial()
-    with pytest.raises(ValueError, match="missing outcomes: cost"):
+    with pytest.raises(ValueError, match="missing outcomes: cost, duration"):
         complete_trial(trial["trial_index"], {"yield": 10})
