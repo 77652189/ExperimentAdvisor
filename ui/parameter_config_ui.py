@@ -25,6 +25,16 @@ MODE_LABELS = {
     "自定义权重": "weighted_custom",
 }
 MODE_NAMES = {value: key for key, value in MODE_LABELS.items()}
+OBJECTIVE_LABELS = {
+    "yield": "产量",
+    "cost": "成本",
+    "duration": "周期",
+    "advisor_score": "综合评分",
+}
+
+
+def _objective_label(key: str) -> str:
+    return OBJECTIVE_LABELS.get(key, key)
 
 
 def _default_variables() -> list[dict[str, Any]]:
@@ -90,11 +100,15 @@ def _optimization_controls() -> tuple[str, dict[str, float] | None]:
         current = st.session_state.objective_weights
         col1, col2, col3 = st.columns(3)
         weights = {
-            "yield": col1.number_input("yield 权重", min_value=0.0, value=float(current.get("yield", 0.6))),
-            "cost": col2.number_input("cost 权重", min_value=0.0, value=float(current.get("cost", 0.2))),
-            "duration": col3.number_input("duration 权重", min_value=0.0, value=float(current.get("duration", 0.2))),
+            "yield": col1.number_input("产量权重", min_value=0.0, value=float(current.get("yield", 0.6))),
+            "cost": col2.number_input("成本权重", min_value=0.0, value=float(current.get("cost", 0.2))),
+            "duration": col3.number_input("周期权重", min_value=0.0, value=float(current.get("duration", 0.2))),
         }
-        st.caption(f"归一化权重：{normalize_weights(weights, mode)}")
+        normalized = normalize_weights(weights, mode)
+        st.caption(
+            "归一化权重："
+            f"产量 {normalized['yield']:.2f}，成本 {normalized['cost']:.2f}，周期 {normalized['duration']:.2f}"
+        )
     st.session_state.optimization_mode = mode
     st.session_state.objective_weights = weights or normalize_weights(None, mode)
     return mode, weights
@@ -162,7 +176,7 @@ def _outcome_rows(predicted: dict[str, Any]) -> list[dict[str, Any]]:
             display_range = "暂无预测"
         rows.append(
             {
-                "指标": name,
+                "指标": _objective_label(name),
                 "预测区间": display_range,
                 "方向": direction_names.get(payload.get("direction"), payload.get("direction", "")),
             }
@@ -172,7 +186,7 @@ def _outcome_rows(predicted: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _best_rows(best_outcomes: dict[str, Any]) -> list[dict[str, Any]]:
     return [
-        {"指标": name, "历史最优": payload.get("value"), "批次": payload.get("trial_index")}
+        {"指标": _objective_label(name), "历史最优": payload.get("value"), "批次": payload.get("trial_index")}
         for name, payload in best_outcomes.items()
     ]
 
@@ -208,7 +222,7 @@ def _experiment_controls(variables: list[dict[str, Any]], mode: str, weights: di
     bayes_limit = state.get("bayes_trial_limit")
     bayes_label = f"{bayes_done}/{bayes_limit}" if bayes_limit is not None else f"{bayes_done}/不限"
     cols[2].metric("Bayes", bayes_label)
-    cols[3].metric("主目标", state.get("primary_objective", "yield"))
+    cols[3].metric("主目标", _objective_label(state.get("primary_objective", "yield")))
 
     limit_col1, limit_col2 = st.columns(2)
     doe_batch_limit = int(
@@ -265,7 +279,7 @@ def _experiment_controls(variables: list[dict[str, Any]], mode: str, weights: di
             )
             outcomes = {}
             for key in needed:
-                outcomes[key] = st.number_input(key, value=0.0, key=f"outcome_{key}")
+                outcomes[key] = st.number_input(_objective_label(key), value=0.0, key=f"outcome_{key}")
             notes = st.text_area("备注", "")
             submitted = st.form_submit_button("提交结果")
             if submitted:
@@ -289,7 +303,7 @@ def _data_views() -> None:
                 "trial_index": item["trial_index"],
                 "phase": item["phase"],
                 **item.get("parameters", {}),
-                **{f"outcome_{key}": value for key, value in item.get("outcomes", {}).items()},
+                **{_objective_label(key): value for key, value in item.get("outcomes", {}).items()},
                 "notes": item.get("notes", ""),
             }
             for item in trials
@@ -306,7 +320,7 @@ def _data_views() -> None:
         bayes_limit = state.get("bayes_trial_limit")
         cols[2].metric("Bayes", f"{bayes_done}/{bayes_limit}" if bayes_limit is not None else f"{bayes_done}/不限")
         cols[3].metric("下一DOE", state.get("next_doe_index", 0))
-        cols[4].metric("主目标", state.get("primary_objective", "yield"))
+        cols[4].metric("主目标", _objective_label(state.get("primary_objective", "yield")))
         if state.get("best_outcomes"):
             st.write("历史最优")
             st.dataframe(_best_rows(state["best_outcomes"]), width="stretch", hide_index=True)
@@ -336,6 +350,13 @@ def _workflow_page() -> None:
         return
     with st.expander("当前使用的参数配置", expanded=False):
         st.write(f"优化模式：{MODE_NAMES.get(mode, mode)}")
+        if mode == "weighted_custom":
+            st.write(
+                "权重："
+                f"产量 {st.session_state.objective_weights.get('yield', 0):.2f}，"
+                f"成本 {st.session_state.objective_weights.get('cost', 0):.2f}，"
+                f"周期 {st.session_state.objective_weights.get('duration', 0):.2f}"
+            )
         st.dataframe(
             [
                 {

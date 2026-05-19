@@ -96,3 +96,32 @@ def test_bayes_trial_limit_stops_recommendations():
     complete_trial(bayes_trial["trial_index"], {"yield": 90})
     with pytest.raises(ValueError, match="Bayes trial limit reached"):
         get_next_trial()
+
+
+def test_cost_mode_records_cost_as_primary_objective():
+    initialize(optimization_mode="minimize_cost", doe_batch_limit=1)
+    trial = get_next_trial()
+    complete_trial(trial["trial_index"], {"cost": 1.2})
+    state = load_state()
+    assert state["primary_objective"] == "cost"
+    assert state["best_outcomes"]["cost"]["value"] == 1.2
+
+
+def test_duration_mode_records_duration_as_primary_objective():
+    initialize(optimization_mode="minimize_duration", doe_batch_limit=1)
+    trial = get_next_trial()
+    complete_trial(trial["trial_index"], {"duration": 48})
+    state = load_state()
+    assert state["primary_objective"] == "duration"
+    assert state["best_outcomes"]["duration"]["value"] == 48
+
+
+def test_weighted_mode_requires_selected_weighted_outcomes():
+    initialize(
+        optimization_mode="weighted_custom",
+        objective_weights={"yield": 0.7, "cost": 0.3, "duration": 0.0},
+        doe_batch_limit=1,
+    )
+    trial = get_next_trial()
+    with pytest.raises(ValueError, match="missing outcomes: cost"):
+        complete_trial(trial["trial_index"], {"yield": 10})
