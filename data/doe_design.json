@@ -1,5 +1,46 @@
 {
-  "generated_at": null,
-  "batch_limit": 8,
-  "design": []
+  "generated_at": "2026-05-19T13:34:34+08:00",
+  "batch_limit": 4,
+  "design": [
+    {
+      "batch_index": 0,
+      "phase": "doe",
+      "parameters": {
+        "lactose_flow": 3.025011,
+        "temperature": 29.80562,
+        "PH": 7.425331
+      },
+      "warnings": []
+    },
+    {
+      "batch_index": 1,
+      "phase": "doe",
+      "parameters": {
+        "lactose_flow": 5.223211,
+        "temperature": 33.657157,
+        "PH": 7.862302
+      },
+      "warnings": []
+    },
+    {
+      "batch_index": 2,
+      "phase": "doe",
+      "parameters": {
+        "lactose_flow": 4.275029,
+        "temperature": 31.663967,
+        "PH": 7.179005
+      },
+      "warnings": []
+    },
+    {
+      "batch_index": 3,
+      "phase": "doe",
+      "parameters": {
+        "lactose_flow": 2.639427,
+        "temperature": 29.033362,
+        "PH": 7.60488
+      },
+      "warnings": []
+    }
+  ]
 }
