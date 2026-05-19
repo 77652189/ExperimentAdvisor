@@ -1,0 +1,13 @@
+{
+  "phase": "doe",
+  "doe_batch_limit": 8,
+  "completed_count": 0,
+  "next_doe_index": 0,
+  "optimization_mode": "maximize_yield",
+  "primary_objective": "yield",
+  "objective_weights": {"yield": 1.0, "cost": 0.0, "duration": 0.0},
+  "effect_report": null,
+  "best_outcomes": {},
+  "initialized_at": null,
+  "last_updated": null
+}
