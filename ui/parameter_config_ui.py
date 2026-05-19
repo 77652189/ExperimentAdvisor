@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from importlib import reload
 from pathlib import Path
 from typing import Any
 
@@ -10,13 +11,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from experiment_advisor.api.endpoints import complete_trial, get_next_trial, initialize
+from experiment_advisor.api import endpoints
 from experiment_advisor.bayes.scoring import normalize_weights, required_outcomes
 from experiment_advisor.config.config_manager import ConfigManager
 from experiment_advisor.config.space_merger import merge_space
 from experiment_advisor.data_access import load_design, load_pending, load_state, load_trials
 from experiment_advisor.paths import PARAMETER_DEFAULTS_PATH
 from experiment_advisor.storage import read_json
+
+endpoints = reload(endpoints)
+complete_trial = endpoints.complete_trial
+get_next_trial = endpoints.get_next_trial
+initialize = endpoints.initialize
 
 MODE_LABELS = {
     "产量优先": "maximize_yield",
