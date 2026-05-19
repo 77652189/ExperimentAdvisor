@@ -62,11 +62,17 @@ def initialize(
     researcher_config: dict | None = None,
     optimization_mode: str = "maximize_yield",
     objective_weights: dict | None = None,
+    doe_batch_limit: int = 8,
+    bayes_trial_limit: int | None = None,
 ):
+    if doe_batch_limit <= 0:
+        raise ValueError("doe_batch_limit must be > 0")
+    if bayes_trial_limit is not None and bayes_trial_limit < 0:
+        raise ValueError("bayes_trial_limit cannot be negative")
     weights = normalize_weights(objective_weights, optimization_mode)
     primary = primary_objective_for(optimization_mode)
     space, _ = build_space(researcher_config)
-    design = generate_design(space, n_trials=8)
+    design = generate_design(space, n_trials=doe_batch_limit)
     now = now_iso()
     save_trials([])
     save_pending([])
@@ -74,6 +80,7 @@ def initialize(
         {
             "phase": "doe",
             "doe_batch_limit": len(design),
+            "bayes_trial_limit": bayes_trial_limit,
             "completed_count": 0,
             "next_doe_index": 0,
             "optimization_mode": optimization_mode,
@@ -177,6 +184,11 @@ def get_next_trial() -> dict[str, Any]:
             "warnings": row.get("warnings", []),
         }
     else:
+        trials = load_trials()
+        bayes_completed = len([trial for trial in trials if trial.get("phase") == "bayes"])
+        bayes_limit = state.get("bayes_trial_limit")
+        if bayes_limit is not None and bayes_completed >= int(bayes_limit):
+            raise ValueError(f"Bayes trial limit reached: {bayes_completed}/{bayes_limit}")
         optimizer = ExperimentOptimizer(
             space=space,
             constraints=load_constraints(),
