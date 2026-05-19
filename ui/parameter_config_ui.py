@@ -228,7 +228,7 @@ def _experiment_controls(variables: list[dict[str, Any]], mode: str, weights: di
     doe_batch_limit = int(
         limit_col1.number_input(
             "DOE批次数",
-            min_value=1,
+            min_value=0,
             max_value=100,
             value=int(st.session_state.get("doe_batch_limit", state.get("doe_batch_limit", 8))),
             step=1,
@@ -248,7 +248,7 @@ def _experiment_controls(variables: list[dict[str, Any]], mode: str, weights: di
     bayes_trial_limit = None if bayes_trial_limit_raw == 0 else bayes_trial_limit_raw
 
     init_col, next_col = st.columns(2)
-    if init_col.button("初始化 DOE", type="primary", width="stretch"):
+    if init_col.button("初始化实验", type="primary", width="stretch"):
         design = initialize(
             researcher_config={"variables": variables},
             optimization_mode=mode,
@@ -257,7 +257,7 @@ def _experiment_controls(variables: list[dict[str, Any]], mode: str, weights: di
             bayes_trial_limit=bayes_trial_limit,
         )
         st.session_state.latest_design = design
-        st.success("DOE 已初始化")
+        st.success("实验流程已初始化")
         st.rerun()
     if next_col.button("获取下一批建议", width="stretch"):
         try:

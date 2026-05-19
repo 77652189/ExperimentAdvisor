@@ -37,8 +37,11 @@ def _candidate_from_unit(names: list[str], space: dict[str, dict], row: list[flo
 
 
 def generate_design(space: dict[str, dict], n_trials: int = 8) -> list[dict[str, Any]]:
-    if n_trials <= 0:
-        raise ValueError("n_trials must be > 0")
+    if n_trials < 0:
+        raise ValueError("n_trials cannot be negative")
+    if n_trials == 0:
+        save_design(0, [])
+        return []
     names = list(space)
     hard_constraints = load_constraints()
     rows = _lhs_unit(n_trials, len(names))
