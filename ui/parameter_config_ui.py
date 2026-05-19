@@ -140,7 +140,58 @@ def _source_preview(variables: list[dict[str, Any]]) -> None:
         st.warning(str(exc))
         return
     st.write("参数来源预览")
-    st.json(merge_log)
+    source_names = {"researcher": "研究员配置", "literature": "文献知识", "defaults": "系统默认"}
+    rows = [{"变量": name, "来源": source_names.get(source, source)} for name, source in merge_log.items()]
+    st.dataframe(rows, width="stretch", hide_index=True)
+
+
+def _parameter_rows(parameters: dict[str, Any]) -> list[dict[str, Any]]:
+    return [{"变量": name, "建议值": value} for name, value in parameters.items()]
+
+
+def _outcome_rows(predicted: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = []
+    direction_names = {"maximize": "越高越好", "minimize": "越低越好"}
+    for name, payload in predicted.items():
+        value_range = payload.get("range", [])
+        if value_range and value_range[0] is not None:
+            display_range = f"{value_range[0]} ~ {value_range[1]}"
+        else:
+            display_range = "暂无预测"
+        rows.append(
+            {
+                "指标": name,
+                "预测区间": display_range,
+                "方向": direction_names.get(payload.get("direction"), payload.get("direction", "")),
+            }
+        )
+    return rows
+
+
+def _best_rows(best_outcomes: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {"指标": name, "历史最优": payload.get("value"), "批次": payload.get("trial_index")}
+        for name, payload in best_outcomes.items()
+    ]
+
+
+def _recommendation_card(trial: dict[str, Any]) -> None:
+    phase_name = "DOE探索" if trial.get("phase") == "doe" else "Bayes优化"
+    st.info(f"第 {trial['trial_index']} 批建议 · {phase_name}")
+    st.write("建议参数")
+    st.dataframe(_parameter_rows(trial.get("parameters", {})), width="stretch", hide_index=True)
+
+    predicted = trial.get("predicted_outcomes")
+    if predicted:
+        st.write("预测结果")
+        st.dataframe(_outcome_rows(predicted), width="stretch", hide_index=True)
+    if trial.get("confidence"):
+        st.caption(f"当前置信度：{trial['confidence']}")
+    if trial.get("best_outcomes_so_far"):
+        with st.expander("历史最优", expanded=False):
+            st.dataframe(_best_rows(trial["best_outcomes_so_far"]), width="stretch", hide_index=True)
+    with st.expander("调试信息", expanded=False):
+        st.json(trial)
 
 
 def _experiment_controls(variables: list[dict[str, Any]], mode: str, weights: dict[str, float] | None) -> None:
@@ -169,8 +220,7 @@ def _experiment_controls(variables: list[dict[str, Any]], mode: str, weights: di
     pending = load_pending()
     if pending:
         trial = pending[0]
-        st.info(f"当前待执行 trial：{trial['trial_index']}（{trial['phase']}）")
-        st.json(trial)
+        _recommendation_card(trial)
         with st.form("complete_trial_form"):
             st.write("录入实验结果")
             current_state = load_state()
@@ -211,7 +261,17 @@ def _data_views() -> None:
         ]
         st.dataframe(rows, width="stretch")
     with tab_state:
-        st.json(load_state())
+        state = load_state()
+        cols = st.columns(4)
+        cols[0].metric("阶段", state.get("phase", "doe"))
+        cols[1].metric("已完成", state.get("completed_count", 0))
+        cols[2].metric("下一DOE", state.get("next_doe_index", 0))
+        cols[3].metric("主目标", state.get("primary_objective", "yield"))
+        if state.get("best_outcomes"):
+            st.write("历史最优")
+            st.dataframe(_best_rows(state["best_outcomes"]), width="stretch", hide_index=True)
+        with st.expander("调试信息", expanded=False):
+            st.json(state)
 
 
 def main() -> None:
