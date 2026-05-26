@@ -1,17 +1,23 @@
 from __future__ import annotations
 
-from experiment_advisor import complete_trial, get_next_trial, initialize
+from pathlib import Path
+
+from experiment_advisor.ingestion import build_final_dataset
+from experiment_advisor.optimizer import BOEngine
+from experiment_advisor.report import generate_recommendation_report
+from experiment_advisor.space import build_search_space
 
 
 def main() -> None:
-    design = initialize()
-    print("DOE design:")
-    print(design)
-    for _ in range(8):
-        trial = get_next_trial()
-        complete_trial(trial["trial_index"], {"yield": 80.0 + trial["trial_index"]})
-    print("Next bayes recommendation:")
-    print(get_next_trial())
+    input_path = Path("data/final/fermentation_modeling_dataset.csv")
+    if not input_path.exists():
+        raise SystemExit("请先将历史数据放入 data/excel 或 data/csv，并调用 build_final_dataset() 生成 final 数据集。")
+
+    df = build_final_dataset(input_path, output_path=input_path)
+    engine = BOEngine(search_space=build_search_space())
+    engine.cold_start(df)
+    recommendations = engine.recommend(n=1)
+    print(generate_recommendation_report(recommendations))
 
 
 if __name__ == "__main__":
