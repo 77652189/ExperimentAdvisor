@@ -12,8 +12,24 @@ Thumbs.db
 # Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
 
 # Environment
 .env
 .env.*
 !.env.example
+
+# Local analysis tooling
+.understand-anything/
+
+# Fermentation data — never commit raw/processed data
+data/
+
+# Reference repos — third-party projects, not part of this codebase
+reference_repos/
+reference_repo/
+
+# Generated reports/artifacts that may summarize sensitive data
+outputs/
+summary/recommendation_report.md
+summary/supporting_reports/
