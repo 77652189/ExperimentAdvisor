@@ -16,17 +16,13 @@ from experiment_advisor.recommendation.service import compare_recommenders
 from experiment_advisor.report import generate_recommendation_report
 
 METHOD_LABELS = {
-    "xgp_bo_ei": "XGBoost + GP 残差 BO（EI）",
-    "xgp_bo_ucb": "XGBoost + GP 残差 BO（UCB）",
     "standard_bo_ei": "标准 GP-BO（EI）",
-    "standard_bo_ucb": "标准 GP-BO（UCB）",
+    "xgp_bo_ei": "XGBoost + GP 残差 BO（EI）",
 }
 
 METHOD_EXPLANATIONS = {
-    "xgp_bo_ei": "默认主推荐。XGBoost 预测产量均值，GP 只拟合 XGBoost 残差，并用 EI 选择预期改进较大的候选。",
-    "xgp_bo_ucb": "XGP 的探索型版本。UCB 更偏向残差 GP 不确定性较高的区域。",
-    "standard_bo_ei": "标准贝叶斯优化基线。GP 直接拟合产量，用 EI 排序候选。",
-    "standard_bo_ucb": "标准贝叶斯优化的探索型版本。GP 直接拟合产量，用 UCB 排序候选。",
+    "standard_bo_ei": "当前主推荐方法。Gaussian Process 直接拟合产量，并用 EI 选择预期改进较大的候选。",
+    "xgp_bo_ei": "候选参考方法。XGBoost 预测产量均值，GP 只拟合 XGBoost 残差，用于补充查看非线性模型下的建议。",
 }
 
 FEATURE_LABELS = {
@@ -53,8 +49,8 @@ FEATURE_LABELS = {
 }
 
 UNCERTAINTY_LABELS = {
-    "xgp_gp_residual_std": "GP 残差后验标准差",
     "gp_posterior_std": "GP 后验标准差",
+    "xgp_gp_residual_std": "GP 残差后验标准差",
 }
 
 RISK_LABELS = {"low": "低", "medium": "中", "high": "高"}
@@ -164,9 +160,18 @@ def _method_block(method: str, items: list[dict[str, Any]]) -> None:
         st.info("暂无结果。")
 
 
+def _standard_bo_summary(top: dict[str, Any]) -> None:
+    rows = [
+        {"项目": "预测产量", "数值": _num(top.get("predicted_yield")), "说明": "标准 GP 模型对候选点的产量均值预测。"},
+        {"项目": "GP 后验标准差", "数值": _num(top.get("model_uncertainty")), "说明": "标准 GP 对该候选点预测不确定性的估计。"},
+        {"项目": "EI 推荐得分", "数值": _num(top.get("acquisition_score")), "说明": "Expected Improvement，越高表示相对当前历史最好值越值得尝试。"},
+    ]
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
 def _xgp_summary(top: dict[str, Any]) -> None:
     rows = [
-        {"项目": "XGBoost 均值预测", "数值": _num(top.get("xgb_prediction")), "说明": "主预测，学习非线性产量结构。"},
+        {"项目": "XGBoost 均值预测", "数值": _num(top.get("xgb_prediction")), "说明": "学习非线性产量结构。"},
         {"项目": "GP 残差修正", "数值": _num(top.get("gp_residual_mean")), "说明": "对 XGBoost 未解释残差做局部修正。"},
         {"项目": "最终预测产量", "数值": _num(top.get("predicted_yield")), "说明": "XGBoost 均值 + GP 残差修正。"},
         {"项目": "GP 残差后验标准差", "数值": _num(top.get("model_uncertainty")), "说明": "残差模型的不确定性。"},
@@ -217,29 +222,29 @@ def _gp_health(items: list[dict[str, Any]]) -> None:
 
 
 def _metric_explanations() -> None:
-    st.markdown("### XGP 主推荐指标")
+    st.markdown("### 主推荐：标准 GP-BO（EI）")
+    standard_rows = [
+        {"指标": "预测产量", "如何产生": "GP 直接拟合历史产量后，对候选点输出 posterior mean。", "如何解读": "模型预测值，不是实测值。"},
+        {"指标": "GP 后验标准差", "如何产生": "GP 对候选点预测分布的 posterior std。", "如何解读": "越高表示模型在该区域越不确定。"},
+        {"指标": "EI 推荐得分", "如何产生": "Expected Improvement，综合预测均值、后验标准差和当前历史最好值。", "如何解读": "越高表示越有可能带来改进。"},
+    ]
+    st.dataframe(pd.DataFrame(standard_rows), width="stretch", hide_index=True)
+
+    st.markdown("### 候选参考：XGBoost + GP 残差 BO（EI）")
     xgp_rows = [
-        {"指标": "预测产量", "如何产生": "XGBoost 均值 + GP 残差修正。", "如何解读": "候选点的模型预测产量，不是实测值。"},
-        {"指标": "XGBoost 均值", "如何产生": "XGBoost 使用全部搜索特征预测。", "如何解读": "反映模型学到的主要非线性产量结构。"},
+        {"指标": "XGBoost 均值", "如何产生": "XGBoost 使用全部搜索特征预测产量。", "如何解读": "反映非线性模型学到的主要产量结构。"},
         {"指标": "GP 残差修正", "如何产生": "GP 只拟合 XGBoost 的训练残差。", "如何解读": "正值表示局部上调预测，负值表示局部下调预测。"},
         {"指标": "GP 残差后验标准差", "如何产生": "残差 GP 的 posterior std。", "如何解读": "只表示残差模型不确定性，不是湿实验置信区间。"},
         {"指标": "历史距离", "如何产生": "候选点到最近历史实验的标准化距离。", "如何解读": "越高越像外推，工艺采纳风险越高。"},
         {"指标": "边界风险", "如何产生": "候选点靠近搜索空间上下限的程度。", "如何解读": "越高越靠边界，需要检查是否可执行。"},
-        {"指标": "风险等级", "如何产生": "综合历史距离、边界风险和残差不确定性。", "如何解读": "高风险候选不应直接执行，应人工审议。"},
     ]
     st.dataframe(pd.DataFrame(xgp_rows), width="stretch", hide_index=True)
-
-    st.markdown("### 方法对照指标")
-    compare_rows = [
-        {"方法": "标准 GP-BO", "不确定性": "GP 直接拟合产量得到的后验标准差。", "用途": "广泛使用的 BO 基线，用来对照 XGP。"},
-    ]
-    st.dataframe(pd.DataFrame(compare_rows), width="stretch", hide_index=True)
 
 
 def main() -> None:
     st.set_page_config(page_title="发酵工艺优化推荐系统", layout="wide")
     st.title("发酵工艺优化推荐系统")
-    st.caption("主线：XGBoost 预测产量均值，GP 拟合残差并量化不确定性。")
+    st.caption("主方法：标准 GP-BO（EI）。候选参考：XGBoost + GP 残差 BO（EI）。")
 
     with st.sidebar:
         st.header("数据入口")
@@ -248,7 +253,7 @@ def main() -> None:
         run_button = st.button("运行推荐", type="primary", width="stretch")
         st.divider()
         st.markdown("### 默认决策")
-        st.write("默认采用 XGBoost + GP 残差 BO（EI）。标准 GP-BO 只作为对照。")
+        st.write("默认采用标准 GP-BO（EI）作为主推荐；XGBoost + GP 残差 BO（EI）只作为候选参考。")
 
     uploaded_file = st.file_uploader("上传已整理好的 run-level CSV", type=["csv"]) if source == "上传 run-level CSV" else None
 
@@ -270,13 +275,14 @@ def main() -> None:
         st.info("点击左侧“运行推荐”后，系统会训练模型、生成候选点，并输出诊断信息。")
         return
 
-    with st.spinner("正在训练 XGBoost、拟合残差 GP 并生成推荐..."):
+    with st.spinner("正在训练标准 GP-BO、XGP 候选模型并生成推荐..."):
         comparison = compare_recommenders(df, top_k=top_k)
         report_path = PROJECT_ROOT / "summary" / "recommendation_report.md"
         report_md = generate_recommendation_report(comparison, output_path=report_path)
 
-    selected_method = comparison.get("selected_method", "xgp_bo_ei")
+    selected_method = comparison.get("selected_method", "standard_bo_ei")
     selected = comparison.get("selected_recommendations", [])
+    xgp_items = comparison.get("recommendations", {}).get("xgp_bo_ei", [])
     decision = comparison.get("decision", {})
 
     st.success("推荐已生成")
@@ -284,27 +290,26 @@ def main() -> None:
     cols[0].metric("主推荐方法", METHOD_LABELS.get(selected_method, selected_method))
     cols[1].metric("需要人工审议", "是" if decision.get("needs_human_review") else "否")
     cols[2].metric("训练 run 数", comparison.get("n_training_rows"))
-    st.info(decision.get("reason", "默认采用 XGBoost + GP 残差 BO（EI）。"))
+    st.info(decision.get("reason", "默认采用标准 GP-BO（EI）。"))
 
-    tabs = st.tabs(["主推荐", "候选诊断", "残差 GP 健康", "方法对照", "指标说明", "Markdown 报告"])
+    tabs = st.tabs(["主推荐", "XGP 候选", "残差 GP 健康", "指标说明", "Markdown 报告"])
     with tabs[0]:
         _method_block(selected_method, selected)
         if selected:
-            _xgp_summary(selected[0])
+            _standard_bo_summary(selected[0])
             nearest = _nearest_history(df, selected[0].get("params", {}))
             if not nearest.empty:
                 st.write("最相似的历史实验")
                 st.dataframe(nearest, width="stretch", hide_index=True)
     with tabs[1]:
-        st.dataframe(_candidate_table(selected), width="stretch", hide_index=True)
+        _method_block("xgp_bo_ei", xgp_items)
+        if xgp_items:
+            _xgp_summary(xgp_items[0])
     with tabs[2]:
-        _gp_health(comparison.get("recommendations", {}).get("xgp_bo_ei", []))
+        _gp_health(xgp_items)
     with tabs[3]:
-        for method, items in comparison.get("recommendations", {}).items():
-            _method_block(method, items)
-    with tabs[4]:
         _metric_explanations()
-    with tabs[5]:
+    with tabs[4]:
         st.markdown(report_md)
         st.caption(f"报告已写入：{report_path}")
 

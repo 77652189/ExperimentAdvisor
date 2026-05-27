@@ -65,23 +65,23 @@ def generate_recommendation_report(
     offline_analysis: dict | None = None,
     output_path: str | Path | None = None,
 ) -> str:
-    """生成 XGP-first 推荐报告。"""
+    """生成标准 GP-BO 主推荐报告。"""
 
     if isinstance(comparison_result, list):
         comparison = {
             "n_training_rows": None,
             "model_metrics": {},
-            "recommendations": {"xgp_bo_ei": comparison_result},
-            "selected_method": "xgp_bo_ei",
+            "recommendations": {"standard_bo_ei": comparison_result},
+            "selected_method": "standard_bo_ei",
             "selected_recommendations": comparison_result,
         }
     else:
         comparison = comparison_result
 
     decision = comparison.get("decision", {})
-    selected_method = comparison.get("selected_method", "xgp_bo_ei")
+    selected_method = comparison.get("selected_method", "standard_bo_ei")
     selected = comparison.get("selected_recommendations") or comparison.get("recommendations", {}).get(selected_method, [])
-    xgp_items = comparison.get("recommendations", {}).get("xgp_bo_ei", selected)
+    xgp_items = comparison.get("recommendations", {}).get("xgp_bo_ei", [])
 
     lines = [
         "# 发酵工艺优化推荐报告",
@@ -90,27 +90,20 @@ def generate_recommendation_report(
         "## 数据与默认方法",
         f"- 训练 run 数：{_fmt(comparison.get('n_training_rows'))}",
         f"- 目标字段：{comparison.get('target_col', 'yield_g_per_l')}",
-        f"- 默认主推荐：{selected_method}",
+        f"- 主推荐方法：{selected_method}",
+        f"- 候选参考方法：xgp_bo_ei",
         f"- 是否需要人工审议：{decision.get('needs_human_review', False)}",
-        f"- 决策说明：{decision.get('reason', '默认采用 xgp_bo_ei。')}",
+        f"- 决策说明：{decision.get('reason', '默认采用 standard_bo_ei。')}",
         "",
-        "## 主推荐",
+        "## 主推荐：standard_bo_ei",
         *_recommendation_table(selected),
         "",
-        "## XGP 机制说明",
-        "- XGBoost 负责学习参数到产量的非线性均值。",
-        "- GP 只拟合 XGBoost 的训练残差，并提供残差后验标准差。",
-        "- 最终预测产量 = XGBoost 均值预测 + GP 残差修正。",
-        "- 历史距离、边界风险和残差不确定性用于判断候选是否需要人工审议。",
+        "## 候选参考：xgp_bo_ei",
+        *_recommendation_table(xgp_items),
         "",
-        "## 残差 GP 健康检查",
+        "## XGP 残差 GP 健康检查",
         *_xgp_health_lines(xgp_items),
-        "",
-        "## 方法对照",
     ]
-
-    for method, items in comparison.get("recommendations", {}).items():
-        lines.extend(["", f"### {method}", *_recommendation_table(items)])
 
     metrics = comparison.get("model_metrics", {})
     if metrics:
@@ -122,10 +115,10 @@ def generate_recommendation_report(
         [
             "",
             "## 风险说明",
-            "- XGP 的不确定性是残差 GP 后验标准差，不是严格湿实验置信区间。",
+            "- standard_bo_ei 是当前主推荐方法；其不确定性来自 GP 直接拟合产量后的后验标准差。",
+            "- xgp_bo_ei 只作为候选参考；其不确定性是残差 GP 后验标准差，不是湿实验置信区间。",
             "- 历史距离高表示候选点更像外推，需要工艺可行性复核。",
-            "- 边界风险高表示候选点靠近搜索空间边界，不建议直接视作稳妥方案。",
-            "- 标准 GP-BO 只作为对照，不是默认决策。",
+            "- 边界风险高表示候选点靠近搜索空间边界，不建议直接视作稳定方案。",
         ]
     )
 
