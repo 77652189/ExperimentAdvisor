@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pandas as pd
 
 from experiment_advisor.optimizer.constraints import filter_constraints
@@ -24,7 +25,7 @@ def recommend_standard_bo(
     target_col: str = "yield_g_per_l",
     feature_cols: list[str] | None = None,
     candidates: pd.DataFrame | None = None,
-) -> list[dict]:
+) -> dict:
     """标准 GP Bayesian Optimization baseline，支持 EI 和 UCB。"""
 
     try:
@@ -41,7 +42,16 @@ def recommend_standard_bo(
         raise ValueError("At least 5 complete training rows are required for standard BO")
     x = train[features]
     y = train[target_col].astype(float)
-    kernel = ConstantKernel(1.0) * Matern(nu=2.5) + WhiteKernel(noise_level=1.0)
+    n_features = len(features)
+    kernel = (
+        ConstantKernel(1.0, constant_value_bounds=(1e-3, 1e3))
+        * Matern(
+            nu=2.5,
+            length_scale=np.ones(n_features).tolist(),
+            length_scale_bounds=[(1e-2, 1e2)] * n_features,
+        )
+        + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-3, 1e2))
+    )
     gp = make_pipeline(
         StandardScaler(),
         GaussianProcessRegressor(kernel=kernel, normalize_y=True, random_state=42),
@@ -65,15 +75,19 @@ def recommend_standard_bo(
         raise ValueError("acquisition must be 'ei' or 'ucb'")
 
     top = scored.sort_values("acquisition_score", ascending=False).head(top_k)
-    return [
-        {
-            "method": f"standard_bo_{acquisition.lower()}",
-            "rank": int(rank),
-            "params": {feature: float(row[feature]) for feature in features},
-            "predicted_yield": float(row["predicted_yield"]),
-            "model_uncertainty": float(row["model_uncertainty"]),
-            "uncertainty_type": "gp_posterior_std",
-            "acquisition_score": float(row["acquisition_score"]),
-        }
-        for rank, (_, row) in enumerate(top.iterrows(), start=1)
-    ]
+    return {
+        "recommendations": [
+            {
+                "method": f"standard_bo_{acquisition.lower()}",
+                "rank": int(rank),
+                "params": {feature: float(row[feature]) for feature in features},
+                "predicted_yield": float(row["predicted_yield"]),
+                "model_uncertainty": float(row["model_uncertainty"]),
+                "uncertainty_type": "gp_posterior_std",
+                "acquisition_score": float(row["acquisition_score"]),
+            }
+            for rank, (_, row) in enumerate(top.iterrows(), start=1)
+        ],
+        "fitted_gp": gp,
+        "feature_cols": features,
+    }

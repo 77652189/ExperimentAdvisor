@@ -5,6 +5,7 @@ from experiment_advisor.analysis.offline_analyzer import run_offline_analysis
 from experiment_advisor.ingestion.features import engineer_features
 from experiment_advisor.ingestion.loader import load_fermentation_data
 from experiment_advisor.ingestion.pipeline import build_final_dataset, build_run_level_dataset
+from experiment_advisor.ingestion.run_level import MODEL_FEATURES
 from experiment_advisor.ingestion.validator import validate
 from experiment_advisor.optimizer.bo_engine import BOEngine
 from experiment_advisor.optimizer.xgp_bo import recommend_xgp_bo
@@ -14,6 +15,7 @@ from experiment_advisor.space.parameter_space import build_search_space
 
 __all__ = [
     "BOEngine",
+    "MODEL_FEATURES",
     "build_final_dataset",
     "build_run_level_dataset",
     "build_search_space",

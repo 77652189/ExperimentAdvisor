@@ -64,7 +64,7 @@ def compare_recommenders(
     }
 
     try:
-        recommendations["standard_bo_ei"] = recommend_standard_bo(
+        bo_result = recommend_standard_bo(
             history,
             space,
             acquisition="ei",
@@ -73,6 +73,9 @@ def compare_recommenders(
             feature_cols=list(space.bounds),
             candidates=candidates,
         )
+        recommendations["standard_bo_ei"] = bo_result["recommendations"]
+        result["model_info"]["fitted_standard_bo_gp"] = bo_result["fitted_gp"]
+        result["model_info"]["standard_bo_feature_cols"] = bo_result["feature_cols"]
     except ImportError as exc:
         result["standard_bo_error"] = str(exc)
 

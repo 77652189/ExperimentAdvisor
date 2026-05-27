@@ -72,6 +72,35 @@ def _quality_flags(history_distance: float, edge_risk: float, uncertainty: float
     return flags
 
 
+def _select_diverse_top(scored: pd.DataFrame, top_k: int) -> pd.DataFrame:
+    """Select high-acquisition candidates while avoiding identical uncertainty plateaus."""
+
+    ranked = scored.sort_values("acquisition_score", ascending=False)
+    if top_k <= 0 or len(ranked) <= top_k:
+        return ranked.head(top_k)
+
+    selected_indices: list[Any] = []
+    used_uncertainty_bins: set[float] = set()
+    for index, row in ranked.iterrows():
+        uncertainty_bin = round(float(row["model_uncertainty"]), 6)
+        if uncertainty_bin in used_uncertainty_bins:
+            continue
+        selected_indices.append(index)
+        used_uncertainty_bins.add(uncertainty_bin)
+        if len(selected_indices) == top_k:
+            break
+
+    if len(selected_indices) < top_k:
+        for index in ranked.index:
+            if index in selected_indices:
+                continue
+            selected_indices.append(index)
+            if len(selected_indices) == top_k:
+                break
+
+    return ranked.loc[selected_indices]
+
+
 def recommend_xgp_bo(
     df: pd.DataFrame,
     search_space: SearchSpace,
@@ -179,7 +208,7 @@ def recommend_xgp_bo(
         "warnings": [str(item.message) for item in captured_warnings],
     }
     uncertainty_high = max(float(scored["model_uncertainty"].quantile(0.85)), 1e-9)
-    top = scored.sort_values("acquisition_score", ascending=False).head(top_k)
+    top = _select_diverse_top(scored, top_k)
     return [
         {
             "method": f"xgp_bo_{acquisition.lower()}",
