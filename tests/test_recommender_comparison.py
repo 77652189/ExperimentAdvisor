@@ -5,24 +5,34 @@ import pytest
 
 
 def _synthetic_df(n: int = 16) -> pd.DataFrame:
+    """合成数据集，使用真实的 MODEL_FEATURES 列名，确保测试场景与生产一致。"""
     rows = []
     for i in range(n):
-        temp = 31.0 + (i % 4) * 0.4
-        ph = 6.7 + (i % 3) * 0.08
-        feed = 100 + i * 4
-        lactose = 200 + (i % 5) * 20
-        duration = 70 + i
-        y = 90 + 4 * (temp - 31.5) - 8 * abs(ph - 6.82) + 0.12 * feed + 0.04 * lactose
+        shift_time = 20.0 + (i % 4) * 2.0
+        prod_temp = 29.0 + (i % 3) * 0.5
+        lactose = 500 + (i % 5) * 40
+        feed1 = 700 + i * 8
+        feed2 = 80 + (i % 4) * 15
+        lac_start = 20.0 + (i % 3) * 2.0
+        duration = 85 + i
+        y = (
+            140.0
+            - 2.0 * (shift_time - 20.0)
+            + 1.5 * (prod_temp - 29.0)
+            - 0.05 * (lactose - 500.0)
+            + 0.02 * (feed1 - 700.0)
+            - 0.10 * (feed2 - 80.0)
+            - 0.30 * (lac_start - 20.0)
+        )
         rows.append(
             {
                 "fermenter_run_id": f"R{i:02d}",
-                "temperature_c_mean": temp,
-                "ph_mean": ph,
-                "feed1_ml_final": feed,
-                "feed2_ml_final": 50 + i,
-                "lactose_ml_final": lactose,
-                "base_ml_final": 30 + i,
-                "od600_max": 60 + i * 0.5,
+                "temperature_shift_time_h": shift_time,
+                "temperature_production_phase_c": prod_temp,
+                "lactose_total_ml": lactose,
+                "feed1_total_ml": feed1,
+                "feed2_total_ml": feed2,
+                "lactose_first_add_time_h": lac_start,
                 "fermentation_duration_h": duration,
                 "yield_g_per_l": y,
                 "exclude_from_training": False,
