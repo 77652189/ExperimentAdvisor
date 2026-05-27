@@ -18,21 +18,15 @@ from experiment_advisor.report import generate_recommendation_report
 METHOD_LABELS = {
     "xgp_bo_ei": "XGBoost + GP 残差 BO（EI）",
     "xgp_bo_ucb": "XGBoost + GP 残差 BO（UCB）",
-    "conservative_ensemble": "保守 ensemble 对照",
-    "standard_bo_ei": "标准 GP-BO 对照（EI）",
-    "standard_bo_ucb": "标准 GP-BO 对照（UCB）",
-    "single_xgboost": "单 XGBoost 对照",
-    "random_safe": "随机安全候选",
+    "standard_bo_ei": "标准 GP-BO（EI）",
+    "standard_bo_ucb": "标准 GP-BO（UCB）",
 }
 
 METHOD_EXPLANATIONS = {
-    "xgp_bo_ei": "默认主推荐。XGBoost 负责产量均值预测，GP 只拟合 XGBoost 残差，并用 EI 选择预期改进较大的候选。",
-    "xgp_bo_ucb": "XGP 的探索型版本。UCB 会更偏向残差 GP 不确定性较高的区域。",
-    "conservative_ensemble": "保守对照方法，用来检查主推荐是否过度外推或过于激进。",
-    "standard_bo_ei": "标准贝叶斯优化基线，GP 直接拟合产量。",
-    "standard_bo_ucb": "标准贝叶斯优化的探索型基线。",
-    "single_xgboost": "只看 XGBoost 均值模型会推荐什么。",
-    "random_safe": "安全搜索空间内的随机候选，用作底线参照。",
+    "xgp_bo_ei": "默认主推荐。XGBoost 预测产量均值，GP 只拟合 XGBoost 残差，并用 EI 选择预期改进较大的候选。",
+    "xgp_bo_ucb": "XGP 的探索型版本。UCB 更偏向残差 GP 不确定性较高的区域。",
+    "standard_bo_ei": "标准贝叶斯优化基线。GP 直接拟合产量，用 EI 排序候选。",
+    "standard_bo_ucb": "标准贝叶斯优化的探索型版本。GP 直接拟合产量，用 UCB 排序候选。",
 }
 
 FEATURE_LABELS = {
@@ -60,7 +54,6 @@ FEATURE_LABELS = {
 
 UNCERTAINTY_LABELS = {
     "xgp_gp_residual_std": "GP 残差后验标准差",
-    "ensemble_disagreement_std": "ensemble 模型分歧标准差",
     "gp_posterior_std": "GP 后验标准差",
 }
 
@@ -176,7 +169,7 @@ def _xgp_summary(top: dict[str, Any]) -> None:
         {"项目": "XGBoost 均值预测", "数值": _num(top.get("xgb_prediction")), "说明": "主预测，学习非线性产量结构。"},
         {"项目": "GP 残差修正", "数值": _num(top.get("gp_residual_mean")), "说明": "对 XGBoost 未解释残差做局部修正。"},
         {"项目": "最终预测产量", "数值": _num(top.get("predicted_yield")), "说明": "XGBoost 均值 + GP 残差修正。"},
-        {"项目": "GP 残差后验标准差", "数值": _num(top.get("model_uncertainty")), "说明": "残差模型的不确定性，不是 ensemble 分歧。"},
+        {"项目": "GP 残差后验标准差", "数值": _num(top.get("model_uncertainty")), "说明": "残差模型的不确定性。"},
     ]
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
@@ -195,11 +188,7 @@ def _gp_health(items: list[dict[str, Any]]) -> None:
 
     gp_features = health.get("gp_feature_cols") or []
     st.write("GP 实际使用的特征")
-    st.dataframe(
-        pd.DataFrame({"显示名": [_name(col) for col in gp_features], "字段名": gp_features}),
-        width="stretch",
-        hide_index=True,
-    )
+    st.dataframe(pd.DataFrame({"显示名": [_name(col) for col in gp_features], "字段名": gp_features}), width="stretch", hide_index=True)
 
     if health.get("candidate_uncertainty_degenerate"):
         st.error("候选点不确定性几乎完全相同，残差 GP 可能退化。")
@@ -228,15 +217,23 @@ def _gp_health(items: list[dict[str, Any]]) -> None:
 
 
 def _metric_explanations() -> None:
-    rows = [
-        {"指标": "XGBoost 均值", "解释": "主预测，负责学习参数到产量的非线性关系。"},
-        {"指标": "GP 残差修正", "解释": "GP 对 XGBoost 训练残差的局部修正。"},
-        {"指标": "GP 残差后验标准差", "解释": "残差 GP 对未解释部分的不确定性估计。"},
-        {"指标": "历史距离", "解释": "候选点离最近历史实验的标准化距离，越高越像外推。"},
-        {"指标": "边界风险", "解释": "候选点靠近搜索边界的程度。"},
-        {"指标": "风险等级", "解释": "由历史距离、边界风险和残差不确定性综合得到，用于人工审议。"},
+    st.markdown("### XGP 主推荐指标")
+    xgp_rows = [
+        {"指标": "预测产量", "如何产生": "XGBoost 均值 + GP 残差修正。", "如何解读": "候选点的模型预测产量，不是实测值。"},
+        {"指标": "XGBoost 均值", "如何产生": "XGBoost 使用全部搜索特征预测。", "如何解读": "反映模型学到的主要非线性产量结构。"},
+        {"指标": "GP 残差修正", "如何产生": "GP 只拟合 XGBoost 的训练残差。", "如何解读": "正值表示局部上调预测，负值表示局部下调预测。"},
+        {"指标": "GP 残差后验标准差", "如何产生": "残差 GP 的 posterior std。", "如何解读": "只表示残差模型不确定性，不是湿实验置信区间。"},
+        {"指标": "历史距离", "如何产生": "候选点到最近历史实验的标准化距离。", "如何解读": "越高越像外推，工艺采纳风险越高。"},
+        {"指标": "边界风险", "如何产生": "候选点靠近搜索空间上下限的程度。", "如何解读": "越高越靠边界，需要检查是否可执行。"},
+        {"指标": "风险等级", "如何产生": "综合历史距离、边界风险和残差不确定性。", "如何解读": "高风险候选不应直接执行，应人工审议。"},
     ]
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    st.dataframe(pd.DataFrame(xgp_rows), width="stretch", hide_index=True)
+
+    st.markdown("### 方法对照指标")
+    compare_rows = [
+        {"方法": "标准 GP-BO", "不确定性": "GP 直接拟合产量得到的后验标准差。", "用途": "广泛使用的 BO 基线，用来对照 XGP。"},
+    ]
+    st.dataframe(pd.DataFrame(compare_rows), width="stretch", hide_index=True)
 
 
 def main() -> None:
@@ -251,7 +248,7 @@ def main() -> None:
         run_button = st.button("运行推荐", type="primary", width="stretch")
         st.divider()
         st.markdown("### 默认决策")
-        st.write("默认采用 XGBoost + GP 残差 BO（EI）。保守 ensemble 和标准 GP-BO 只作为对照。")
+        st.write("默认采用 XGBoost + GP 残差 BO（EI）。标准 GP-BO 只作为对照。")
 
     uploaded_file = st.file_uploader("上传已整理好的 run-level CSV", type=["csv"]) if source == "上传 run-level CSV" else None
 

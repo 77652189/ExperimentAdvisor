@@ -31,7 +31,7 @@ def _synthetic_df(n: int = 16) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def test_compare_recommenders_returns_standard_bo_and_conservative():
+def test_compare_recommenders_returns_xgp_and_standard_bo_only():
     pytest.importorskip("sklearn")
     from experiment_advisor.optimizer.search_space import build_search_space_from_history
     from experiment_advisor.recommendation.service import compare_recommenders
@@ -39,13 +39,16 @@ def test_compare_recommenders_returns_standard_bo_and_conservative():
     df = _synthetic_df()
     result = compare_recommenders(df, build_search_space_from_history(df), top_k=3)
 
-    assert "conservative_ensemble" in result["recommendations"]
+    assert "xgp_bo_ei" in result["recommendations"]
+    assert "xgp_bo_ucb" in result["recommendations"]
     assert "standard_bo_ei" in result["recommendations"]
     assert "standard_bo_ucb" in result["recommendations"]
-    assert len(result["recommendations"]["conservative_ensemble"]) == 3
-    assert result["recommendations"]["conservative_ensemble"][0]["history_distance"] >= 0
-    assert set(result["model_info"]["model_names"]) <= {"ridge", "elastic_net", "xgboost"}
-    assert "scoring_weights" in result["recommendations"]["conservative_ensemble"][0]
+    assert "conservative_ensemble" not in result["recommendations"]
+    assert "random_safe" not in result["recommendations"]
+    assert "single_xgboost" not in result["recommendations"]
+    assert len(result["recommendations"]["xgp_bo_ei"]) == 3
+    assert result["model_info"]["primary_method"] == "xgp_bo_ei"
+    assert result["model_info"]["comparison_methods"] == ["xgp_bo_ucb", "standard_bo_ei", "standard_bo_ucb"]
     assert result["decision"]["selected_method"] == "xgp_bo_ei"
 
 
@@ -97,13 +100,19 @@ def test_recommendation_report_mentions_both_methods():
             "n_training_rows": 12,
             "model_metrics": {"ridge": {"mae_loocv": 1.2, "r2_loocv": 0.3}},
             "recommendations": {
-                "conservative_ensemble": [{"rank": 1, "params": {"temperature_c_mean": 32.0}, "predicted_yield": 120}],
+                "xgp_bo_ei": [{"rank": 1, "params": {"temperature_c_mean": 32.0}, "predicted_yield": 120}],
                 "standard_bo_ei": [{"rank": 1, "params": {"temperature_c_mean": 31.5}, "predicted_yield": 118}],
             },
+            "selected_method": "xgp_bo_ei",
+            "selected_recommendations": [
+                {"rank": 1, "params": {"temperature_c_mean": 32.0}, "predicted_yield": 120}
+            ],
         }
     )
 
-    assert "conservative_ensemble" in report
+    assert "conservative_ensemble" not in report
+    assert "single_xgboost" not in report
+    assert "random_safe" not in report
     assert "standard_bo_ei" in report
     assert "xgp_bo_ei" in report
     assert "XGBoost" in report
