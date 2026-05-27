@@ -1,26 +1,40 @@
 # ExperimentAdvisor
 
-ExperimentAdvisor 是面向 HMO 发酵工艺优化的数据科学项目。项目按课程 PDF 的三段式要求组织：
+ExperimentAdvisor 是一个面向 HMO 发酵工艺优化的 Python 项目。当前定位不是自动替代实验员决策，而是基于历史实验数据生成下一批实验建议，并同时给出预测值、不确定性和风险解释，供研发人员审阅后再和工艺团队确认。
 
-1. **EXTRACT**：从 Excel/CSV 整理发酵实验数据，完成清洗、校验和特征工程。
-2. **LEARN**：训练 surrogate 模型，并对标准 BO 与保守 ensemble 推荐器做对照。
-3. **PREDICT**：输出下一批实验推荐、预测值、风险说明和可复现实验报告。
+## 当前推荐策略
 
-本项目主题为 **HMO fermentation yield recommendation**，问题类型以产量 `yield_g_per_l` 的回归建模和候选实验推荐为主。
+主推荐方法是 `standard_bo_ei`：
 
-## 课程交付目录
+- 使用 Gaussian Process 直接拟合历史 `yield_g_per_l`
+- 在同一搜索空间内采样合法候选点
+- 使用 EI（Expected Improvement）对候选排序
+- 输出下一批建议参数、预测产量和 GP 后验不确定性
+
+候选参考方法是 `xgp_bo_ei`：
+
+- XGBoost 学习参数到产量的非线性均值预测
+- GP 只拟合 XGBoost 的训练残差
+- 输出 XGP 候选建议，帮助判断标准 BO 推荐是否和非线性模型明显分歧
+
+## 项目结构
 
 ```text
-data/              # PDF 中的 /Data：原始 Excel、CSV、final 数据、清洗脚本
-Notebooks/         # EDA、建模、预测 demo notebook
-App/               # Streamlit app，占 bonus 交付位
-Model/             # 保存 best model、feature columns、model info
-Slides/            # 5-10 页展示材料或视频说明
-summary/           # 一页总结和 supporting reports
-README.md          # 运行说明
+experiment_advisor/
+  ingestion/          # 数据读取、校验、run-level 聚合和训练视图构建
+  optimizer/          # 标准 GP-BO、XGP-BO、搜索空间与约束
+  recommendation/     # 高层推荐服务：主推荐 + 候选参考
+  report/             # Markdown 推荐报告
+  analysis/           # 离线分析与诊断工具
+  model/              # 旧模型训练/注册工具，当前不作为主推荐路径
+App/
+  app.py              # Streamlit bonus 入口，中文可解释界面
+summary/              # 一页总结与 supporting reports
+Slides/               # 展示材料说明
+tests/                # 自动化测试
 ```
 
-代码实现仍保留在 `experiment_advisor/`，测试在 `tests/`。根目录 `data/` 是真实数据目录，保持原位不搬动。
+根目录 `data/` 存放真实发酵实验数据，必须保持本地私有，不上传 GitHub。
 
 ## 数据目录
 
@@ -28,53 +42,55 @@ README.md          # 运行说明
 data/
   excel/           # 原始 Excel 文件
   csv/             # 旧 CSV 或对照 CSV
-  csv_from_excel/  # 从 Excel 整理得到的可信 CSV
-  final/           # 校验、建模、特征工程后的正式入模数据
+  csv_from_excel/  # 从 Excel 整理得到的可用 CSV
+  final/           # run-level 建模数据
   scripts/         # 数据转换和清洗脚本
 ```
 
-旧 DOE 运行态 JSON 已从主流程移除。
+`data/` 已在 `.gitignore` 中忽略。
 
-## 快速开始
+## 安装
 
 ```bash
 pip install -r requirements.txt
 ```
 
-将 Excel 转换为 schema CSV 并生成对比报告：
+## 运行推荐
 
-```bash
-python data/scripts/convert_excel_to_schema_csv.py
+### Python 调用
+
+```python
+from experiment_advisor.ingestion import build_run_level_dataset
+from experiment_advisor.recommendation import compare_recommenders
+from experiment_advisor.report import generate_recommendation_report
+
+df = build_run_level_dataset(
+    source_dir="data/csv_from_excel",
+    output_path="data/final/run_level_modeling_dataset.csv",
+)
+
+comparison = compare_recommenders(df, top_k=5)
+print("主推荐方法：", comparison["selected_method"])
+print(comparison["selected_recommendations"][0])
+
+generate_recommendation_report(
+    comparison,
+    output_path="summary/recommendation_report.md",
+)
 ```
 
-运行测试：
+### Streamlit UI
+
+```bash
+streamlit run App/app.py
+```
+
+UI 默认读取 `data/final/run_level_modeling_dataset.csv`，使用 `standard_bo_ei` 作为主推荐，并在单独页签中展示 `xgp_bo_ei` 候选参考、残差 GP 健康诊断和指标说明。
+
+## 测试
 
 ```bash
 python -m pytest -q
 ```
 
-## Python 示例
-
-```python
-from experiment_advisor.ingestion import build_final_dataset
-from experiment_advisor.space import build_search_space
-from experiment_advisor.analysis import estimate_noise, run_offline_analysis
-from experiment_advisor.optimizer import BOEngine
-from experiment_advisor.optimizer.state import save
-from experiment_advisor.report import generate_recommendation_report
-
-df = build_final_dataset("data/excel/history.xlsx")
-analysis = run_offline_analysis(df, output_dir="summary/supporting_reports")
-
-engine = BOEngine(build_search_space(), noise_std=estimate_noise(df))
-engine.cold_start(df)
-recommendations = engine.recommend(n=1)
-
-save(engine.ax_client, "Model/experiment_state.json")
-report_md = generate_recommendation_report(
-    recommendations,
-    offline_analysis=analysis,
-    output_path="summary/recommendation.md",
-)
-print(report_md)
-```
+当前测试覆盖 run-level 数据构建、搜索空间、报告生成、标准 BO 主推荐和 XGP 候选推荐。
