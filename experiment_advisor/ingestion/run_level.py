@@ -22,6 +22,7 @@ CONTROL_FEATURES = [
     "lactose_total_ml",
     "lactose_first_add_time_h",
     "lactose_last_add_time_h",
+    "lactose_after_48h_ml",
     "fermentation_duration_h",
 ]
 
@@ -37,14 +38,20 @@ CONTROL_FEATURES = [
 #   feed1_end_time_h            — 与 fermentation_duration_h 高度冗余（r=0.96）
 #   feed2_end_time_h            — 与 feed2_total_ml 高度冗余（r=0.89）
 #   lactose_last_add_time_h     — 高低产组无显著差异（p=0.258），与 lactose_total_ml 语义重叠
+#   fermentation_duration_h     — Spearman r=-0.29（最弱），与 feed2_total_ml/temperature_shift_time_h
+#                                  高度混淆（r≈0.53）；短周期实验产量不低于长周期，
+#                                  时长是实验代次的代理变量而非独立工艺参数
+#   lactose_after_48h_ml        — Spearman r=-0.70，但与 temperature_shift_time_h 高度共线
+#                                  （两者均为实验年代代理变量）。加入后 BoTorch GP ARD 将
+#                                  temperature_shift_time_h 压平（length scale → ∞），
+#                                  LOO-CV 无改善（MAE 10.71 vs 10.74），净效果为负，回退。
 MODEL_FEATURES: list[str] = [
     "temperature_shift_time_h",        # 产量最强预测因子：Spearman r=-0.55，高产组比低产组早 6.7 h
-    "temperature_production_phase_c",  # r=0.51，独立可调的生产相温度
-    "lactose_total_ml",                # r=-0.52，HMO 底物总量
-    "feed1_total_ml",                  # r=0.38，主碳源补料量
-    "feed2_total_ml",                  # r=-0.42，与乳糖竞争，与产量负相关
-    "lactose_first_add_time_h",        # r=-0.32，乳糖首次添加时机
-    "fermentation_duration_h",         # r=-0.29，发酵总时长
+    "temperature_production_phase_c",  # Spearman r=0.51，独立可调的生产相温度
+    "lactose_total_ml",                # Spearman r=-0.52，HMO 底物总量
+    "feed1_total_ml",                  # Spearman r=0.38，主碳源补料量
+    "feed2_total_ml",                  # Spearman r=-0.42，与乳糖竞争，与产量负相关
+    "lactose_first_add_time_h",        # Pearson r=-0.39，乳糖首次添加时机，与时长独立性好
 ]
 
 
