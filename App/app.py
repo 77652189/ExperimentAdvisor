@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import sys
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from experiment_advisor.ingestion.run_level import TARGET_COL, training_view
-from experiment_advisor.recommendation.service import compare_recommenders
+from experiment_advisor.optimizer.search_space import SearchSpace
+import experiment_advisor.recommendation.service as recommendation_service
+from experiment_advisor.recommendation.quality import evaluate_recommendation_quality
 from experiment_advisor.report import generate_recommendation_report
 
 
@@ -40,25 +43,22 @@ def _configure_plot_fonts() -> None:
 _configure_plot_fonts()
 
 METHOD_LABELS = {
-    "standard_bo_ei": "标准 GP-BO（EI）",
-    "xgp_bo_ei": "XGBoost + GP 残差 BO（EI）",
+    "standard_bo_qnei": "标准 GP-BO（qNEI）",
 }
 
 METHOD_EXPLANATIONS = {
-    "standard_bo_ei": "Gaussian Process 直接拟合产量，并用 EI 选择预期改进较大的候选。",
-    "xgp_bo_ei": "候选参考方法。XGBoost 预测产量均值，GP 只拟合 XGBoost 残差，用于补充查看非线性模型下的建议。",
+    "standard_bo_qnei": "BoTorch SingleTaskGP 直接拟合产量，并用 qNEI 联合优化下一批推荐。",
 }
 
 UNCERTAINTY_LABELS = {
     "gp_posterior_std": "GP 后验标准差",
-    "xgp_gp_residual_std": "GP 残差后验标准差",
 }
 
 RISK_LABELS = {"low": "低", "medium": "中", "high": "高"}
 FLAG_LABELS = {
     "far_from_history": "远离历史实验",
     "near_search_boundary": "接近参数边界",
-    "high_residual_uncertainty": "残差不确定性较高",
+    "high_residual_uncertainty": "不确定性较高",
 }
 
 
@@ -75,6 +75,217 @@ def _load_field_labels() -> dict[str, str]:
 
 
 FIELD_LABELS = _load_field_labels()
+
+
+def _compare_recommenders(df: pd.DataFrame, top_k: int, seed: int, method: str = "ei") -> dict[str, Any]:
+    service = importlib.reload(recommendation_service)
+    return service.compare_recommenders(df, top_k=top_k, seed=seed, method=method)
+
+
+def _recommendation_pool_size(top_k: int, multiplier: int = 3) -> int:
+    return min(max(top_k * multiplier, top_k), 40)
+
+
+def _ensure_strategy_quality(comparison: dict[str, Any], df: pd.DataFrame, feature_cols: list[str]) -> dict[str, Any]:
+    quality = comparison.get("strategy_quality_pool") or comparison.get("strategy_quality") or {}
+    if quality:
+        return quality
+
+    selected = comparison.get("unfiltered_selected_recommendations") or comparison.get("selected_recommendations", [])
+    search_bounds = comparison.get("search_space") or {}
+    features = feature_cols or list(search_bounds)
+    if not selected or not search_bounds or not features:
+        return {}
+
+    space = SearchSpace(bounds={name: tuple(bounds) for name, bounds in search_bounds.items()})
+    quality = evaluate_recommendation_quality(
+        selected,
+        _training_data(df),
+        space,
+        feature_cols=features,
+        target_col=TARGET_COL,
+    )
+    comparison["strategy_quality"] = quality
+    return quality
+
+
+def _select_without_soft_filters(
+    comparison: dict[str, Any],
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    target_count: int,
+) -> dict[str, Any]:
+    selected_method = comparison.get("selected_method", "standard_bo_qnei")
+    base = (
+        comparison.get("unfiltered_selected_recommendations")
+        or comparison.get("recommendations", {}).get(selected_method, [])
+        or comparison.get("selected_recommendations", [])
+    )
+    selected = []
+    for item in base[:target_count]:
+        tagged = item.copy()
+        tagged.pop("soft_filter_status", None)
+        tagged.pop("history_range_violations", None)
+        tagged.pop("history_range_violation_features", None)
+        selected.append(tagged)
+
+    comparison["unfiltered_selected_recommendations"] = base
+    comparison["selected_recommendations"] = selected
+    comparison["soft_filter"] = {
+        "enabled": False,
+        "n_before": len(base),
+        "n_after": len(selected),
+        "target_count": target_count,
+    }
+
+    search_bounds = comparison.get("search_space") or {}
+    if search_bounds:
+        space = SearchSpace(bounds={name: tuple(bounds) for name, bounds in search_bounds.items()})
+        comparison["strategy_quality"] = evaluate_recommendation_quality(
+            selected,
+            _training_data(df),
+            space,
+            feature_cols=feature_cols,
+            target_col=TARGET_COL,
+        )
+    return comparison
+
+
+def _history_sigma_ranges(df: pd.DataFrame, feature_cols: list[str], sigma: float) -> dict[str, tuple[float, float, float]]:
+    train = _training_data(df)
+    ranges: dict[str, tuple[float, float, float]] = {}
+    for feature in feature_cols:
+        if feature not in train.columns:
+            continue
+        values = pd.to_numeric(train[feature], errors="coerce").dropna()
+        if len(values) < 2:
+            continue
+        mean = float(values.mean())
+        std = float(values.std(ddof=0))
+        if std <= 1e-12:
+            continue
+        ranges[feature] = (mean - sigma * std, mean + sigma * std, std)
+    return ranges
+
+
+def _history_range_violation(
+    recommendation: dict[str, Any],
+    ranges: dict[str, tuple[float, float, float]],
+) -> tuple[int, float, list[str]]:
+    count = 0
+    total_excess = 0.0
+    features = []
+    for feature, value in recommendation.get("params", {}).items():
+        if feature not in ranges or value is None:
+            continue
+        low, high, std = ranges[feature]
+        numeric_value = float(value)
+        if numeric_value < low:
+            count += 1
+            total_excess += (low - numeric_value) / std
+            features.append(feature)
+        elif numeric_value > high:
+            count += 1
+            total_excess += (numeric_value - high) / std
+            features.append(feature)
+    return count, total_excess, features
+
+
+def _apply_soft_filters(
+    comparison: dict[str, Any],
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    max_nearest_history_distance: float,
+    max_boundary_risk: float,
+    history_sigma: float,
+    target_count: int | None = None,
+) -> dict[str, Any]:
+    quality = _ensure_strategy_quality(comparison, df, feature_cols)
+    per_items = quality.get("per_recommendation") or []
+    if not per_items:
+        return comparison
+
+    base = comparison.get("unfiltered_selected_recommendations") or comparison.get("selected_recommendations", [])
+    per_by_rank = {item.get("rank"): item for item in per_items}
+    sigma_ranges = _history_sigma_ranges(df, feature_cols, history_sigma)
+
+    def failure_reasons(rec: dict[str, Any]) -> dict[str, Any]:
+        quality_item = per_by_rank.get(rec.get("rank"), {})
+        nearest = quality_item.get("nearest_history_distance")
+        boundary = quality_item.get("boundary_risk")
+        sigma_violation_count, _, sigma_features = _history_range_violation(rec, sigma_ranges)
+        return {
+            "nearest": nearest is not None and nearest > max_nearest_history_distance,
+            "boundary": boundary is not None and boundary > max_boundary_risk,
+            "history_range": sigma_violation_count > 0,
+            "history_range_features": sigma_features,
+        }
+
+    def passes(rec: dict[str, Any]) -> bool:
+        reasons = failure_reasons(rec)
+        return not (reasons["nearest"] or reasons["boundary"] or reasons["history_range"])
+
+    passed = [item for item in base if passes(item)]
+    failed = [item for item in base if item.get("rank") not in {rec.get("rank") for rec in passed}]
+    keep_count = target_count if target_count is not None else len(base)
+
+    selected = []
+    for item in passed[:keep_count]:
+        tagged = item.copy()
+        tagged["soft_filter_status"] = "通过"
+        violation_count, _, violation_features = _history_range_violation(item, sigma_ranges)
+        tagged["history_range_violations"] = violation_count
+        tagged["history_range_violation_features"] = violation_features
+        selected.append(tagged)
+
+    failed_sigma = [
+        item.get("rank")
+        for item in failed
+        if failure_reasons(item)["history_range"]
+    ]
+    failed_nearest = [
+        item.get("rank")
+        for item in failed
+        if failure_reasons(item)["nearest"]
+    ]
+    failed_boundary = [
+        item.get("rank")
+        for item in failed
+        if failure_reasons(item)["boundary"]
+    ]
+    comparison["unfiltered_selected_recommendations"] = base
+    comparison["selected_recommendations"] = selected
+    comparison["strategy_quality_pool"] = quality
+    search_bounds = comparison.get("search_space") or {}
+    if search_bounds:
+        space = SearchSpace(bounds={name: tuple(bounds) for name, bounds in search_bounds.items()})
+        comparison["strategy_quality"] = evaluate_recommendation_quality(
+            selected,
+            _training_data(df),
+            space,
+            feature_cols=feature_cols,
+            target_col=TARGET_COL,
+        )
+    comparison["soft_filter"] = {
+        "enabled": True,
+        "max_nearest_history_distance": max_nearest_history_distance,
+        "max_boundary_risk": max_boundary_risk,
+        "history_sigma": history_sigma,
+        "n_before": len(base),
+        "n_passed": len(passed),
+        "n_after": len(selected),
+        "target_count": keep_count,
+        "failed_ranks": [item.get("rank") for item in failed],
+        "failed_nearest_history_ranks": failed_nearest,
+        "failed_boundary_risk_ranks": failed_boundary,
+        "failed_history_range_ranks": failed_sigma,
+        "failure_counts": {
+            "nearest_history_distance": len(failed_nearest),
+            "boundary_risk": len(failed_boundary),
+            "history_range": len(failed_sigma),
+        },
+    }
+    return comparison
 
 
 def _load_default_dataset() -> pd.DataFrame:
@@ -154,25 +365,15 @@ def _candidate_table(method: str, items: list[dict[str, Any]]) -> pd.DataFrame:
     rows = []
     for item in items:
         row = {"排序": item.get("rank"), "预测产量": _num(item.get("predicted_yield"))}
-        if method == "standard_bo_ei":
+        if item.get("soft_filter_status"):
+            row["软过滤状态"] = item.get("soft_filter_status")
+        if item.get("history_range_violations") is not None:
+            row["历史范围超限数"] = item.get("history_range_violations")
+        if method == "standard_bo_qnei":
             row.update(
                 {
                     "GP 后验标准差": _num(item.get("model_uncertainty")),
-                    "EI 推荐得分": _num(item.get("acquisition_score")),
-                }
-            )
-        else:
-            row.update(
-                {
-                    "XGBoost 均值": _num(item.get("xgb_prediction")),
-                    "GP 残差修正": _num(item.get("gp_residual_mean")),
-                    "不确定性": _num(item.get("model_uncertainty")),
-                    "不确定性定义": UNCERTAINTY_LABELS.get(item.get("uncertainty_type"), item.get("uncertainty_type")),
-                    "历史距离": _num(item.get("history_distance")),
-                    "边界风险": _num(item.get("boundary_risk")),
-                    "风险等级": RISK_LABELS.get(item.get("risk_level"), item.get("risk_level")),
-                    "风险标记": _flags(item.get("quality_flags")),
-                    "推荐得分": _num(item.get("acquisition_score")),
+                    "qNEI 批量推荐得分": _num(item.get("acquisition_score")),
                 }
             )
         for key, value in item.get("params", {}).items():
@@ -255,7 +456,7 @@ def _standard_bo_summary(top: dict[str, Any]) -> None:
     rows = [
         {"项目": "预测产量", "数值": _num(top.get("predicted_yield")), "说明": "标准 GP 模型对候选点的产量均值预测。"},
         {"项目": "GP 后验标准差", "数值": _num(top.get("model_uncertainty")), "说明": "标准 GP 对该候选点预测不确定性的估计。"},
-        {"项目": "EI 推荐得分", "数值": _num(top.get("acquisition_score")), "说明": "Expected Improvement，越高表示相对当前历史最好值越值得尝试。"},
+        {"项目": "qNEI 批量推荐得分", "数值": _num(top.get("acquisition_score")), "说明": "qNEI 联合优化后候选点的模型均值展示值，批内点由联合采集函数生成。"},
     ]
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
@@ -278,9 +479,21 @@ def _standard_gp_slice_frame(
     if len(train) < 5:
         raise ValueError("至少需要 5 条完整训练数据才能绘制标准 GP 图。")
 
-    low, high = search_space[feature]
-    grid = pd.DataFrame([params] * n_points)
-    grid[feature] = np.linspace(float(low), float(high), n_points)
+    # Fix other features at historical mean — makes the slice deterministic
+    # (independent of which recommendation or seed was used).
+    hist_means = {f: float(train[f].mean()) for f in feature_cols if f in train.columns}
+    anchor = {**hist_means, **{k: v for k, v in params.items() if k not in feature_cols}}
+
+    # X-axis spans the historical observed range, not the full search-space bounds.
+    # If the recommended value falls outside, extend the range to include it.
+    hist_min = float(train[feature].min())
+    hist_max = float(train[feature].max())
+    rec_val = float(params.get(feature, hist_means.get(feature, hist_min)))
+    x_min = min(hist_min, rec_val)
+    x_max = max(hist_max, rec_val)
+
+    grid = pd.DataFrame([anchor] * n_points)
+    grid[feature] = np.linspace(x_min, x_max, n_points)
     mean, std = fitted_gp.predict(grid[feature_cols], return_std=True)
     curve = pd.DataFrame(
         {
@@ -296,7 +509,7 @@ def _standard_gp_slice_frame(
 
 def _standard_gp_plot(
     df: pd.DataFrame,
-    top: dict[str, Any],
+    items: list[dict[str, Any]] | dict[str, Any],
     search_space: dict[str, Any],
     fitted_gp: Any,
     feature_cols: list[str],
@@ -305,20 +518,48 @@ def _standard_gp_plot(
         st.info("标准 GP 模型不可用，无法绘制后验切片图。")
         return
 
-    params = top.get("params", {})
-    features = [feature for feature in feature_cols if feature in search_space and feature in params and feature in df.columns]
+    # Accept either a single recommendation dict or a list
+    if isinstance(items, dict):
+        items = [items]
+    if not items:
+        st.info("当前推荐缺少可绘图参数。")
+        return
+
+    # Build rank labels for the switcher
+    rank_options = {
+        f"推荐 #{item.get('rank', i + 1)}（预测产量 {_num(item.get('predicted_yield', ''))} g/L）": item
+        for i, item in enumerate(items)
+    }
+
+    st.markdown("### 标准 GP 后验切片图")
+    st.caption(
+        "其它参数固定在历史均值，只沿一个参数变化，横轴为历史实测范围。"
+        "红虚线为所选推荐点的参数值。此图曲线与随机种子和采集函数无关，反映模型学到的稳定规律。"
+    )
+
+    col_rec, col_feat = st.columns([2, 3])
+    with col_rec:
+        selected_label = st.radio(
+            "查看推荐",
+            list(rank_options.keys()),
+            index=0,
+            key="standard_gp_slice_rank",
+        )
+    active_item = rank_options[selected_label]
+    params = active_item.get("params", {})
+
+    features = [f for f in feature_cols if f in search_space and f in params and f in df.columns]
     if not features:
         st.info("当前推荐缺少可绘图参数。")
         return
 
-    st.markdown("### 标准 GP 后验切片图")
-    st.caption("固定主推荐点的其它参数，只沿一个参数变化，展示标准 GP 的 posterior mean 和 95% 区间。")
-    feature = st.selectbox(
-        "选择横轴参数",
-        features,
-        format_func=_display_name,
-        key="standard_gp_slice_feature",
-    )
+    with col_feat:
+        feature = st.selectbox(
+            "选择横轴参数",
+            features,
+            format_func=_display_name,
+            key="standard_gp_slice_feature",
+        )
 
     try:
         curve, train = _standard_gp_slice_frame(df, params, search_space, feature, fitted_gp, feature_cols)
@@ -337,7 +578,8 @@ def _standard_gp_plot(
         label="95% posterior interval",
     )
     ax.scatter(train[feature], train[TARGET_COL], color="#111827", s=24, alpha=0.65, label="history")
-    ax.axvline(float(params[feature]), color="#dc2626", linestyle="--", linewidth=1.5, label="recommended value")
+    rec_val = float(params[feature])
+    ax.axvline(rec_val, color="#dc2626", linestyle="--", linewidth=1.5, label=f"recommended value ({rec_val:.2f})")
     ax.set_xlabel(_display_name(feature))
     ax.set_ylabel(_display_name(TARGET_COL))
     ax.grid(alpha=0.2)
@@ -410,13 +652,8 @@ def _pdp_summary(fitted_gp: Any, train: pd.DataFrame, feature_cols: list[str]) -
 
 def _gp_pdp(df: pd.DataFrame, fitted_gp: Any, feature_cols: list[str]) -> None:
     """使用偏依赖图展示 GP 各特征的平均边际效应。"""
-    try:
-        import math as _math
-        import numpy as np
-        from sklearn.inspection import PartialDependenceDisplay
-    except ImportError as exc:
-        st.warning(f"偏依赖图需要 scikit-learn >= 1.0：{exc}")
-        return
+    import math as _math
+    import numpy as np
 
     if fitted_gp is None:
         st.info("标准 GP 模型不可用，无法绘制偏依赖图。")
@@ -454,21 +691,22 @@ def _gp_pdp(df: pd.DataFrame, fitted_gp: Any, feature_cols: list[str]) -> None:
     fig1, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
     axes_flat = np.array(axes).flatten()
 
-    PartialDependenceDisplay.from_estimator(
-        fitted_gp,
-        train,
-        features=list(range(n_features)),
-        feature_names=[_display_name(col) for col in feature_cols],
-        kind="average",
-        grid_resolution=50,
-        ax=axes_flat[:n_features],
-        random_state=42,
-    )
-    for index, ax in enumerate(axes_flat[:n_features]):
-        ax.set_title(_display_name(feature_cols[index]), fontsize=10)
-        ax.set_xlabel(_display_name(feature_cols[index]))
+    for i, feature in enumerate(feature_cols):
+        curve = _pdp_curve(fitted_gp, train, feature_cols, feature, n_points=50)
+        ax = axes_flat[i]
+        ax.plot(curve[feature], curve["mean_prediction"], color="#2563eb", linewidth=1.8)
+        y_min = float(curve["mean_prediction"].min())
+        y_max = float(curve["mean_prediction"].max())
+        margin = (y_max - y_min) * 0.15 if y_max > y_min else 1.0
+        rug_y = y_min - margin * 0.6
+        ax.plot(train[feature].values, np.full(len(train), rug_y),
+                "|", color="black", markersize=8, alpha=0.6)
+        ax.set_ylim(rug_y - margin * 0.2, y_max + margin * 0.2)
+        ax.set_title(_display_name(feature), fontsize=10)
+        ax.set_xlabel(_display_name(feature))
         ax.set_ylabel("平均预测产量（g/L）")
         ax.grid(alpha=0.2)
+
     for ax in axes_flat[n_features:]:
         ax.set_visible(False)
 
@@ -484,20 +722,41 @@ def _gp_pdp(df: pd.DataFrame, fitted_gp: Any, feature_cols: list[str]) -> None:
             "两个相关性最强的特征（EDA Spearman r=0.91）的联合偏依赖图。"
             "颜色越深表示该参数组合下 GP 预测产量越高。"
         )
-        idx_a = feature_cols.index(key_a)
-        idx_b = feature_cols.index(key_b)
+        a_low = float(train[key_a].quantile(0.05))
+        a_high = float(train[key_a].quantile(0.95))
+        b_low = float(train[key_b].quantile(0.05))
+        b_high = float(train[key_b].quantile(0.95))
+        grid_a = np.linspace(a_low, a_high, 20)
+        grid_b = np.linspace(b_low, b_high, 20)
+        Z = np.zeros((len(grid_b), len(grid_a)))
+        for i, val_a in enumerate(grid_a):
+            for j, val_b in enumerate(grid_b):
+                batch = train.copy()
+                batch[key_a] = val_a
+                batch[key_b] = val_b
+                Z[j, i] = float(np.mean(fitted_gp.predict(batch[feature_cols])))
+
+        in_window = (
+            train[key_a].between(a_low, a_high)
+            & train[key_b].between(b_low, b_high)
+        )
+        n_outside = int((~in_window).sum())
+        if n_outside:
+            st.caption(
+                f"该 2D 图只显示 5%-95% 历史分位窗口，避免把少数边缘点拉大坐标轴并造成外推误读；"
+                f"{n_outside} 个窗口外历史点未参与坐标轴缩放。"
+            )
 
         fig2, ax2 = plt.subplots(figsize=(7, 5))
-        PartialDependenceDisplay.from_estimator(
-            fitted_gp,
-            train,
-            features=[(idx_a, idx_b)],
-            feature_names=[_display_name(col) for col in feature_cols],
-            kind="average",
-            grid_resolution=20,
-            ax=[ax2],
-            random_state=42,
-        )
+        filled = ax2.contourf(grid_a, grid_b, Z, levels=10, cmap="viridis")
+        plt.colorbar(filled, ax=ax2, label="预测产量（g/L）")
+        contour_lines = ax2.contour(grid_a, grid_b, Z, levels=10,
+                                    colors="black", linewidths=0.5, alpha=0.6)
+        ax2.clabel(contour_lines, fmt="%.2f", fontsize=8)
+        ax2.scatter(train.loc[in_window, key_a], train.loc[in_window, key_b],
+                    marker="|", color="black", alpha=0.5, s=60, zorder=5)
+        ax2.set_xlim(a_low, a_high)
+        ax2.set_ylim(b_low, b_high)
         ax2.set_xlabel(_display_name(key_a))
         ax2.set_ylabel(_display_name(key_b))
         ax2.set_title("GP预测产量：升温时机 × 乳糖总量")
@@ -655,91 +914,184 @@ def _nearest_history_validation(
     st.dataframe(table, width="stretch", hide_index=True)
 
 
-def _xgp_summary(top: dict[str, Any]) -> None:
-    rows = [
-        {"项目": "XGBoost 均值预测", "数值": _num(top.get("xgb_prediction")), "说明": "学习非线性产量结构。"},
-        {"项目": "GP 残差修正", "数值": _num(top.get("gp_residual_mean")), "说明": "对 XGBoost 未解释残差做局部修正。"},
-        {"项目": "最终预测产量", "数值": _num(top.get("predicted_yield")), "说明": "XGBoost 均值 + GP 残差修正。"},
-        {"项目": "GP 残差后验标准差", "数值": _num(top.get("model_uncertainty")), "说明": "残差模型的不确定性。"},
-    ]
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+def _metric_value(metrics: dict[str, Any], key: str) -> Any:
+    value = metrics.get(key)
+    return _num(value) if isinstance(value, int | float) else value
 
 
-def _gp_health(items: list[dict[str, Any]]) -> None:
-    health = (items[0].get("gp_health") if items else None) or {}
-    if not health:
-        st.info("当前结果没有残差 GP 健康诊断。")
-        return
+def _strategy_quality_block(comparison: dict[str, Any], df: pd.DataFrame, selected: list[dict[str, Any]], feature_cols: list[str]) -> None:
+    quality = comparison.get("strategy_quality") or {}
+    if not quality:
+        search_bounds = comparison.get("search_space") or {}
+        features = feature_cols or list(search_bounds)
+        if selected and search_bounds and features:
+            try:
+                space = SearchSpace(bounds={name: tuple(bounds) for name, bounds in search_bounds.items()})
+                quality = evaluate_recommendation_quality(
+                    selected,
+                    _training_data(df),
+                    space,
+                    feature_cols=features,
+                    target_col=TARGET_COL,
+                )
+                comparison["strategy_quality"] = quality
+                st.caption("当前结果来自旧缓存，已基于现有推荐现场补算策略质量指标。")
+            except Exception as exc:
+                st.info(f"当前结果没有推荐策略质量指标，现场补算也失败：{exc}")
+                return
+        else:
+            st.info("当前结果没有推荐策略质量指标。请重新运行推荐生成完整诊断。")
+            return
 
-    cols = st.columns(4)
-    cols[0].metric("残差均值", _num(health.get("residual_mean")))
-    cols[1].metric("残差标准差", _num(health.get("residual_std")))
-    cols[2].metric("最大绝对残差", _num(health.get("residual_max_abs")))
-    cols[3].metric("不确定性种类数", health.get("candidate_uncertainty_unique_rounded"))
+    st.markdown("### Batch 多样性")
+    diversity = quality.get("batch_diversity", {})
+    diversity_cols = st.columns(4)
+    diversity_cols[0].metric("最小两两距离", _metric_value(diversity, "min_pairwise_distance"))
+    diversity_cols[1].metric("平均两两距离", _metric_value(diversity, "mean_pairwise_distance"))
+    diversity_cols[2].metric("簇数量", diversity.get("cluster_count_threshold_0_10"))
+    diversity_cols[3].metric("平均特征覆盖", _metric_value(diversity, "mean_feature_range_coverage"))
 
-    gp_features = health.get("gp_feature_cols") or []
-    st.write("GP 实际使用的特征")
-    st.dataframe(pd.DataFrame({"显示名": [_name(col) for col in gp_features], "字段名": gp_features}), width="stretch", hide_index=True)
+    coverage = diversity.get("feature_range_coverage") or {}
+    if coverage:
+        coverage_rows = [
+            {"参数": _display_name(feature), "字段名": feature, "覆盖比例": _num(value)}
+            for feature, value in coverage.items()
+        ]
+        st.dataframe(pd.DataFrame(coverage_rows), width="stretch", hide_index=True)
 
-    if health.get("candidate_uncertainty_degenerate"):
-        st.error("候选点不确定性几乎完全相同，残差 GP 可能退化。")
+    st.markdown("### 历史支撑与边界风险")
+    support = quality.get("history_support", {})
+    boundary = quality.get("boundary_risk", {})
+    risk_cols = st.columns(4)
+    risk_cols[0].metric("平均最近邻距离", _metric_value(support, "mean_nearest_history_distance"))
+    risk_cols[1].metric("最远最近邻距离", _metric_value(support, "max_nearest_history_distance"))
+    risk_cols[2].metric("平均边界风险", _metric_value(boundary, "mean_boundary_risk"))
+    risk_cols[3].metric("高边界风险数量", boundary.get("n_near_boundary_gt_0_8"))
+
+    per_items = quality.get("per_recommendation") or []
+    if per_items:
+        rows = []
+        for item in per_items:
+            rows.append(
+                {
+                    "排序": item.get("rank"),
+                    "类型": item.get("recommendation_type", "—"),
+                    "预测产量": _num(item.get("predicted_yield")),
+                    "GP 后验标准差": _num(item.get("model_uncertainty")),
+                    "最近邻距离": _num(item.get("nearest_history_distance")),
+                    "最近邻 Run": item.get("nearest_run_id", "—"),
+                    "最近邻产量": _num(item.get("nearest_run_yield")),
+                    "边界风险": _num(item.get("boundary_risk")),
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    st.markdown("### 推荐参数的历史近邻")
+    st.caption("为每个推荐组合分别展示最相似的历史实验实际产量，用于判断整批推荐是否落在有数据支撑的区域。")
+    if selected:
+        for item in selected:
+            rank = item.get("rank", "?")
+            predicted = item.get("predicted_yield")
+            title = f"推荐 #{rank}"
+            if predicted is not None:
+                title = f"{title}｜预测产量 {_num(predicted)} g/L"
+            with st.expander(title, expanded=rank == 1):
+                selected_params = {**item.get("params", {}), "predicted_yield": predicted}
+                _nearest_history_validation(df, selected_params, feature_cols)
     else:
-        st.success("候选点不确定性可以区分不同候选，残差 GP 未表现为常数退化。")
-
-    st.dataframe(
-        pd.DataFrame(
-            [
-                {"指标": "候选不确定性最小值", "数值": _num(health.get("candidate_uncertainty_min"))},
-                {"指标": "候选不确定性最大值", "数值": _num(health.get("candidate_uncertainty_max"))},
-            ]
-        ),
-        width="stretch",
-        hide_index=True,
-    )
-
-    warnings = health.get("warnings") or []
-    if warnings:
-        st.warning("GP 训练出现警告，建议谨慎解释残差不确定性。")
-        for message in warnings:
-            st.caption(message)
-
-    with st.expander("GP kernel 详情", expanded=False):
-        st.code(str(health.get("kernel", "")), language="text")
+        st.info("暂无推荐点，无法做历史近邻对比。")
 
 
 def _metric_explanations() -> None:
-    st.markdown("### 主推荐：标准 GP-BO（EI）")
+    st.markdown("### 主推荐：标准 GP-BO（qNEI）")
     standard_rows = [
         {"指标": "预测产量", "如何产生": "GP 直接拟合历史产量后，对候选点输出 posterior mean。", "如何解读": "模型预测值，不是实测值。"},
         {"指标": "GP 后验标准差", "如何产生": "GP 对候选点预测分布的 posterior std。", "如何解读": "越高表示模型在该区域越不确定。"},
-        {"指标": "EI 推荐得分", "如何产生": "Expected Improvement，综合预测均值、后验标准差和当前历史最好值。", "如何解读": "越高表示越有可能带来改进。"},
+        {"指标": "qNEI 批量推荐", "如何产生": "BoTorch qNoisyExpectedImprovement 联合优化整批候选点。", "如何解读": "批内候选会考虑边际收益递减，减少 top-k 聚集。"},
+        {"指标": "观测噪声", "如何产生": "qNEI 基于 noisy baseline 建模已观测数据。", "如何解读": "相比直接使用历史最大值的 EI，更不容易被噪声高点牵引。"},
     ]
     st.dataframe(pd.DataFrame(standard_rows), width="stretch", hide_index=True)
-
-    st.markdown("### 候选参考：XGBoost + GP 残差 BO（EI）")
-    xgp_rows = [
-        {"指标": "XGBoost 均值", "如何产生": "XGBoost 使用全部搜索特征预测产量。", "如何解读": "反映非线性模型学到的主要产量结构。"},
-        {"指标": "GP 残差修正", "如何产生": "GP 只拟合 XGBoost 的训练残差。", "如何解读": "正值表示局部上调预测，负值表示局部下调预测。"},
-        {"指标": "GP 残差后验标准差", "如何产生": "残差 GP 的 posterior std。", "如何解读": "只表示残差模型不确定性，不是湿实验置信区间。"},
-        {"指标": "历史距离", "如何产生": "候选点到最近历史实验的标准化距离。", "如何解读": "越高越像外推，工艺采纳风险越高。"},
-        {"指标": "边界风险", "如何产生": "候选点靠近搜索空间上下限的程度。", "如何解读": "越高越靠边界，需要检查是否可执行。"},
-    ]
-    st.dataframe(pd.DataFrame(xgp_rows), width="stretch", hide_index=True)
 
 
 def main() -> None:
     st.set_page_config(page_title="发酵工艺优化推荐系统", layout="wide")
     st.title("发酵工艺优化推荐系统")
-    st.caption("主方法：标准 GP-BO（EI）。候选参考：XGBoost + GP 残差 BO（EI）。")
+    st.caption("主方法：标准 GP-BO（qNEI），使用 BoTorch 联合优化批量推荐。")
 
     with st.sidebar:
         st.header("数据入口")
         source = st.radio("选择数据来源", ["使用 data/final/run_level_modeling_dataset.csv", "上传 run-level CSV"])
+        bo_method = st.radio(
+            "推荐方法",
+            options=["EI（顺序贪心）", "qNEI（批量联合）"],
+            index=0,
+            help=(
+                "EI：单点期望改善，顺序贪心生成批次，结果稳定可解释，推荐作为主方法。\n\n"
+                "qNEI：联合批量优化，理论上多样性更好，但对随机种子敏感，推荐值偶有偏离历史分布。"
+            ),
+            key="bo_method",
+        )
+        _method_arg = "ei" if bo_method.startswith("EI") else "qnei"
         top_k = st.slider("推荐数量", min_value=1, max_value=10, value=5)
+        seed = st.number_input(
+            "随机种子",
+            min_value=0,
+            max_value=9999,
+            value=0,
+            step=1,
+            help="固定种子保证每次运行结果一致。修改为不同整数可探索多组推荐方案。",
+            key="bo_seed",
+        )
+        enable_soft_filter = st.checkbox(
+            "启用软过滤",
+            value=False,
+            help="开启后先生成更大的候选池，再按最近邻距离、边界风险和历史合理范围筛出主推荐。",
+            key="enable_soft_filter",
+        )
+        candidate_pool_multiplier = 1
+        max_nearest_history_distance = 2.0
+        max_boundary_risk = 0.8
+        history_sigma = 2.0
+        if enable_soft_filter:
+            candidate_pool_multiplier = st.slider(
+                "候选池倍数",
+                min_value=1,
+                max_value=5,
+                value=3,
+                help="先生成 推荐数量×倍数 的候选池，再用软过滤筛出主推荐。候选池越大越可能凑够通过项，但运行会更慢。",
+                key="candidate_pool_multiplier",
+            )
+            max_nearest_history_distance = st.number_input(
+                "最大最近邻距离",
+                min_value=0.0,
+                max_value=10.0,
+                value=2.0,
+                step=0.1,
+                help="软过滤阈值。推荐点到最近历史实验的标准化距离超过该值时，不进入主推荐。",
+                key="max_nearest_history_distance",
+            )
+            max_boundary_risk = st.number_input(
+                "最大边界风险",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.8,
+                step=0.05,
+                help="软过滤阈值。推荐点过于靠近搜索空间边界时，不进入主推荐。",
+                key="max_boundary_risk",
+            )
+            history_sigma = st.number_input(
+                "历史合理范围 σ 倍数",
+                min_value=0.5,
+                max_value=5.0,
+                value=2.0,
+                step=0.5,
+                help="软过滤阈值。每个参数以历史均值±k个标准差作为合理范围，比绝对min/max更能抵抗异常批次。",
+                key="history_sigma",
+            )
         run_button = st.button("运行推荐", type="primary", width="stretch")
         st.divider()
         st.markdown("### 默认决策")
-        st.write("默认采用标准 GP-BO（EI）作为主推荐；XGBoost + GP 残差 BO（EI）只作为候选参考。")
+        st.write("默认采用标准 GP-BO（qNEI）作为主推荐；qNEI 联合优化整批候选点并处理观测噪声。")
 
     uploaded_file = st.file_uploader("上传已整理好的 run-level CSV", type=["csv"]) if source == "上传 run-level CSV" else None
 
@@ -758,8 +1110,30 @@ def main() -> None:
 
     _overview(df)
     if run_button:
-        with st.spinner("正在训练标准 GP-BO、XGP 候选模型并生成推荐..."):
-            comparison = compare_recommenders(df, top_k=top_k)
+        with st.spinner("正在训练标准 GP-BO（qNEI）并生成推荐..."):
+            pool_size = _recommendation_pool_size(top_k, candidate_pool_multiplier) if enable_soft_filter else int(top_k)
+            comparison = _compare_recommenders(df, top_k=pool_size, seed=int(seed), method=_method_arg)
+            comparison["requested_top_k"] = int(top_k)
+            comparison["recommendation_pool_size"] = int(pool_size)
+            comparison["soft_filter_enabled"] = bool(enable_soft_filter)
+            feature_cols_for_filter = comparison.get("model_info", {}).get("standard_bo_feature_cols", [])
+            if enable_soft_filter:
+                comparison = _apply_soft_filters(
+                    comparison,
+                    df,
+                    feature_cols_for_filter,
+                    max_nearest_history_distance=float(max_nearest_history_distance),
+                    max_boundary_risk=float(max_boundary_risk),
+                    history_sigma=float(history_sigma),
+                    target_count=int(top_k),
+                )
+            else:
+                comparison = _select_without_soft_filters(
+                    comparison,
+                    df,
+                    feature_cols_for_filter,
+                    target_count=int(top_k),
+                )
             report_path = PROJECT_ROOT / "summary" / "recommendation_report.md"
             report_md = generate_recommendation_report(comparison, output_path=report_path)
         st.session_state["recommendation_comparison"] = comparison
@@ -773,54 +1147,96 @@ def main() -> None:
         st.info("点击左侧“运行推荐”后，系统会训练模型、生成候选点，并输出诊断信息。")
         return
 
-    selected_method = comparison.get("selected_method", "standard_bo_ei")
+    selected_method = comparison.get("selected_method", "standard_bo_qnei")
     selected = comparison.get("selected_recommendations", [])
-    xgp_items = comparison.get("recommendations", {}).get("xgp_bo_ei", [])
     decision = comparison.get("decision", {})
     fitted_gp = comparison.get("model_info", {}).get("fitted_standard_bo_gp")
     feature_cols = comparison.get("model_info", {}).get("standard_bo_feature_cols", [])
+    comparison["soft_filter_enabled"] = bool(enable_soft_filter)
+    if enable_soft_filter:
+        comparison = _apply_soft_filters(
+            comparison,
+            df,
+            feature_cols,
+            max_nearest_history_distance=float(max_nearest_history_distance),
+            max_boundary_risk=float(max_boundary_risk),
+            history_sigma=float(history_sigma),
+            target_count=int(comparison.get("requested_top_k", top_k)),
+        )
+    else:
+        comparison = _select_without_soft_filters(
+            comparison,
+            df,
+            feature_cols,
+            target_count=int(comparison.get("requested_top_k", top_k)),
+        )
+    selected = comparison.get("selected_recommendations", [])
+    report_md = generate_recommendation_report(comparison, output_path=report_path)
+    st.session_state["recommendation_comparison"] = comparison
+    st.session_state["recommendation_report_md"] = report_md
 
     st.success("推荐已生成")
-    cols = st.columns(3)
+    cols = st.columns(2)
     cols[0].metric("主推荐方法", METHOD_LABELS.get(selected_method, selected_method))
-    cols[1].metric("需要人工审议", "是" if decision.get("needs_human_review") else "否")
-    cols[2].metric("训练 run 数", comparison.get("n_training_rows"))
-    st.info(decision.get("reason", "默认采用标准 GP-BO（EI）。"))
+    cols[1].metric("训练 run 数", comparison.get("n_training_rows"))
+    st.info(decision.get("reason", "默认采用标准 GP-BO（qNEI）。"))
+    soft_filter = comparison.get("soft_filter") or {}
+    if soft_filter and not soft_filter.get("enabled", True):
+        st.caption(
+            "软过滤未启用：直接显示 BO 候选池前 {after}/{target} 个推荐。".format(
+                after=soft_filter.get("n_after"),
+                target=soft_filter.get("target_count"),
+            )
+        )
+    elif soft_filter:
+        st.caption(
+            "软过滤：最近邻距离 <= {dist}，边界风险 <= {risk}，历史合理范围 ±{sigma}σ；"
+            "候选池 {before} 个，通过 {passed} 个，当前显示 {after}/{target} 个推荐。".format(
+                dist=_num(soft_filter.get("max_nearest_history_distance")),
+                risk=_num(soft_filter.get("max_boundary_risk")),
+                sigma=_num(soft_filter.get("history_sigma")),
+                passed=soft_filter.get("n_passed"),
+                after=soft_filter.get("n_after"),
+                before=soft_filter.get("n_before"),
+                target=soft_filter.get("target_count"),
+            )
+        )
+        failure_counts = soft_filter.get("failure_counts") or {}
+        if failure_counts:
+            st.caption(
+                "软过滤失败原因计数（可重叠）：最近邻距离 {nearest}，边界风险 {boundary}，历史合理范围 {history_range}。".format(
+                    nearest=failure_counts.get("nearest_history_distance", 0),
+                    boundary=failure_counts.get("boundary_risk", 0),
+                    history_range=failure_counts.get("history_range", 0),
+                )
+            )
+        if soft_filter.get("failed_nearest_history_ranks"):
+            st.caption(f"最近邻距离超限推荐排序：{soft_filter.get('failed_nearest_history_ranks')}")
+        if soft_filter.get("failed_boundary_risk_ranks"):
+            st.caption(f"边界风险超限推荐排序：{soft_filter.get('failed_boundary_risk_ranks')}")
+        if soft_filter.get("failed_history_range_ranks"):
+            st.caption(f"历史合理范围外推荐排序：{soft_filter.get('failed_history_range_ranks')}")
+        if soft_filter.get("target_count") and soft_filter.get("n_after", 0) < soft_filter.get("target_count"):
+            st.warning("当前候选池中通过软过滤的推荐不足目标数量；建议放宽阈值、提高候选池倍数，或更换随机种子。")
 
-    tabs = st.tabs(["主推荐", "XGP 候选", "推荐验证", "GP 偏依赖图", "残差 GP 健康", "指标说明", "Markdown 报告"])
+    tabs = st.tabs(["主推荐", "代理模型验证", "推荐策略质量", "GP 偏依赖图", "指标说明", "Markdown 报告"])
     with tabs[0]:
         _method_block(selected_method, selected)
         if selected:
             _standard_bo_summary(selected[0])
-            _standard_gp_plot(df, selected[0], comparison.get("search_space", {}), fitted_gp, feature_cols)
-            nearest = _nearest_history(df, selected[0].get("params", {}))
-            if not nearest.empty:
-                st.write("最相似的历史实验")
-                st.dataframe(nearest, width="stretch", hide_index=True)
+            _standard_gp_plot(df, selected, comparison.get("search_space", {}), fitted_gp, feature_cols)
     with tabs[1]:
-        _method_block("xgp_bo_ei", xgp_items)
-        if xgp_items:
-            _xgp_summary(xgp_items[0])
-    with tabs[2]:
         st.markdown("### LOO-CV 模型泛化能力")
         st.caption("验证 GP 模型是否能预测它没见过的实验结果。这是判断推荐可信度的核心依据。")
         _loocv_scatter(df, feature_cols)
-
-        st.divider()
-
-        st.markdown("### 推荐参数的历史近邻")
-        st.caption("与推荐参数最相似的历史实验实际产量，验证推荐是否落在有数据支撑的高产区域。")
-        if selected:
-            selected_params = {**selected[0].get("params", {}), "predicted_yield": selected[0].get("predicted_yield")}
-            _nearest_history_validation(df, selected_params, feature_cols)
+    with tabs[2]:
+        _strategy_quality_block(comparison, df, selected, feature_cols)
     with tabs[3]:
         st.caption("偏依赖图反映特征的平均边际效应，自然携带历史数据中的特征协变关系，优于固定其他参数的条件切片图。")
         _gp_pdp(df, fitted_gp, feature_cols)
     with tabs[4]:
-        _gp_health(xgp_items)
-    with tabs[5]:
         _metric_explanations()
-    with tabs[6]:
+    with tabs[5]:
         st.markdown(report_md)
         st.caption(f"报告已写入：{report_path}")
 

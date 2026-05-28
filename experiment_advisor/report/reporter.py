@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Any
 
 
+STANDARD_BO_KEY = "standard_bo_qnei"
+
+
 def _fmt(value: Any) -> str:
     if value is None:
         return "-"
@@ -19,44 +22,19 @@ def _params_text(item: dict[str, Any]) -> str:
 
 def _recommendation_table(items: list[dict]) -> list[str]:
     lines = [
-        "| Rank | 预测产量 | XGBoost 均值 | GP 残差修正 | 不确定性 | 历史距离 | 边界风险 | 风险等级 | 推荐得分 | 参数 |",
-        "|------|----------|--------------|--------------|----------|----------|----------|----------|----------|------|",
+        "| Rank | 预测产量 | GP 后验标准差 | 推荐展示分 | 参数 |",
+        "|------|----------|----------------|------------|------|",
     ]
     for item in items:
         lines.append(
-            "| {rank} | {pred} | {xgb} | {resid} | {unc} | {dist} | {boundary} | {risk} | {score} | {params} |".format(
+            "| {rank} | {pred} | {unc} | {score} | {params} |".format(
                 rank=item.get("rank", "-"),
                 pred=_fmt(item.get("predicted_yield")),
-                xgb=_fmt(item.get("xgb_prediction")),
-                resid=_fmt(item.get("gp_residual_mean")),
                 unc=_fmt(item.get("model_uncertainty")),
-                dist=_fmt(item.get("history_distance")),
-                boundary=_fmt(item.get("boundary_risk")),
-                risk=item.get("risk_level", "-"),
                 score=_fmt(item.get("acquisition_score")),
                 params=_params_text(item),
             )
         )
-    return lines
-
-
-def _xgp_health_lines(items: list[dict]) -> list[str]:
-    health = (items[0].get("gp_health") if items else None) or {}
-    if not health:
-        return ["暂无残差 GP 健康诊断。"]
-    gp_features = ", ".join(health.get("gp_feature_cols", []))
-    lines = [
-        f"- GP 使用特征：{gp_features}",
-        f"- 训练残差均值：{_fmt(health.get('residual_mean'))}",
-        f"- 训练残差标准差：{_fmt(health.get('residual_std'))}",
-        f"- 最大绝对残差：{_fmt(health.get('residual_max_abs'))}",
-        f"- 候选不确定性范围：{_fmt(health.get('candidate_uncertainty_min'))} 到 {_fmt(health.get('candidate_uncertainty_max'))}",
-        f"- 不确定性是否退化为常数：{health.get('candidate_uncertainty_degenerate')}",
-    ]
-    warnings = health.get("warnings") or []
-    if warnings:
-        lines.append("- GP 训练警告：")
-        lines.extend(f"  - {message}" for message in warnings)
     return lines
 
 
@@ -65,23 +43,22 @@ def generate_recommendation_report(
     offline_analysis: dict | None = None,
     output_path: str | Path | None = None,
 ) -> str:
-    """生成标准 GP-BO 主推荐报告。"""
+    """Generate a Markdown report for the qNEI standard GP-BO recommendation."""
 
     if isinstance(comparison_result, list):
         comparison = {
             "n_training_rows": None,
             "model_metrics": {},
-            "recommendations": {"standard_bo_ei": comparison_result},
-            "selected_method": "standard_bo_ei",
+            "recommendations": {STANDARD_BO_KEY: comparison_result},
+            "selected_method": STANDARD_BO_KEY,
             "selected_recommendations": comparison_result,
         }
     else:
         comparison = comparison_result
 
     decision = comparison.get("decision", {})
-    selected_method = comparison.get("selected_method", "standard_bo_ei")
+    selected_method = comparison.get("selected_method", STANDARD_BO_KEY)
     selected = comparison.get("selected_recommendations") or comparison.get("recommendations", {}).get(selected_method, [])
-    xgp_items = comparison.get("recommendations", {}).get("xgp_bo_ei", [])
 
     lines = [
         "# 发酵工艺优化推荐报告",
@@ -91,18 +68,12 @@ def generate_recommendation_report(
         f"- 训练 run 数：{_fmt(comparison.get('n_training_rows'))}",
         f"- 目标字段：{comparison.get('target_col', 'yield_g_per_l')}",
         f"- 主推荐方法：{selected_method}",
-        f"- 候选参考方法：xgp_bo_ei",
+        "- 优化器：BoTorch qNEI + MLE SingleTaskGP",
         f"- 是否需要人工审议：{decision.get('needs_human_review', False)}",
-        f"- 决策说明：{decision.get('reason', '默认采用 standard_bo_ei。')}",
+        f"- 决策说明：{decision.get('reason', '默认采用 standard_bo_qnei。')}",
         "",
-        "## 主推荐：standard_bo_ei",
+        f"## 主推荐：{STANDARD_BO_KEY}",
         *_recommendation_table(selected),
-        "",
-        "## 候选参考：xgp_bo_ei",
-        *_recommendation_table(xgp_items),
-        "",
-        "## XGP 残差 GP 健康检查",
-        *_xgp_health_lines(xgp_items),
     ]
 
     metrics = comparison.get("model_metrics", {})
@@ -115,10 +86,10 @@ def generate_recommendation_report(
         [
             "",
             "## 风险说明",
-            "- standard_bo_ei 是当前主推荐方法；其不确定性来自 GP 直接拟合产量后的后验标准差。",
-            "- xgp_bo_ei 只作为候选参考；其不确定性是残差 GP 后验标准差，不是湿实验置信区间。",
-            "- 历史距离高表示候选点更像外推，需要工艺可行性复核。",
-            "- 边界风险高表示候选点靠近搜索空间边界，不建议直接视作稳定方案。",
+            "- standard_bo_qnei 是当前主推荐方法；其不确定性来自 GP 直接拟合产量后的后验标准差。",
+            "- qNEI 联合优化整批候选点，能够缓解逐点 EI top-k 造成的 batch 聚集。",
+            "- qNEI 显式处理观测噪声，相比直接使用历史最大值的 EI 更不容易被噪声高点牵引。",
+            "- GP 后验标准差不是湿实验置信区间，最终采纳仍需结合工艺可执行性复核。",
         ]
     )
 
