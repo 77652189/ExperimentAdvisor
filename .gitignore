@@ -23,7 +23,17 @@ __pycache__/
 .understand-anything/
 
 # Fermentation data — never commit raw/processed data
-data/
+data/*
+!data/pichia/
+data/pichia/*
+!data/pichia/templates/
+!data/pichia/templates/pichia_run_level_template.csv
+!data/pichia/uploads/
+data/pichia/uploads/*
+!data/pichia/uploads/.gitkeep
+!data/pichia/final/
+data/pichia/final/*
+!data/pichia/final/.gitkeep
 
 # Reference repos — third-party projects, not part of this codebase
 reference_repos/

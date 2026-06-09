@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 
 
@@ -45,6 +47,36 @@ def test_nearest_history_deduplicates_display_columns(monkeypatch):
     assert not nearest.columns.duplicated().any()
     assert list(nearest.columns).count("重复列") == 1
     assert "重复列_2" in nearest.columns
+
+
+def test_dataset_fingerprint_is_stable_across_column_order():
+    from App import app
+
+    left = pd.DataFrame({"a": [1, 2], "b": ["x", "y"]})
+    right = left[["b", "a"]].copy()
+
+    assert app._dataset_fingerprint(left) == app._dataset_fingerprint(right)
+
+
+def test_recommendation_cache_reads_only_matching_dataset():
+    from App import app
+
+    state = {}
+    comparison = {"selected_recommendations": [{"rank": 1}]}
+
+    app._write_recommendation_cache(
+        state,
+        dataset_fingerprint="same-data",
+        comparison=comparison,
+        report_md="report",
+        report_path=Path("summary/recommendation_report.md"),
+        run_settings={"seed": 0},
+    )
+
+    cached = app._read_recommendation_cache(state, "same-data")
+    assert cached is not None
+    assert cached["comparison"] is comparison
+    assert app._read_recommendation_cache(state, "changed-data") is None
 
 
 def test_soft_filter_uses_larger_pool_instead_of_supplementing_failures():
