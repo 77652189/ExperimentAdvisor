@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from experiment_advisor.ingestion.run_level import build_run_level_dataset, training_view
+from experiment_advisor.ingestion.run_level import MODEL_FEATURES, build_run_level_dataset, training_view
 
 
 def test_build_run_level_dataset_from_real_csv_from_excel(tmp_path):
@@ -21,6 +21,10 @@ def test_build_run_level_dataset_from_real_csv_from_excel(tmp_path):
     assert "feed1_start_time_h" in df.columns
     assert "feed1_before_24h_ml" in df.columns
     assert "lactose_first_add_time_h" in df.columns
+    assert "lactose_after_48h_ml" in df.columns
+    assert "lactose_after_48h_log1p" in df.columns
+    assert "lactose_after_48h_ml" in MODEL_FEATURES
+    assert "lactose_after_48h_log1p" in MODEL_FEATURES
     assert "temperature_c_mean" in df.columns
     assert "temperature_growth_phase_c" in df.columns
     assert "temperature_shift_time_h" in df.columns
@@ -31,4 +35,6 @@ def test_build_run_level_dataset_from_real_csv_from_excel(tmp_path):
     assert train["yield_g_per_l"].notna().all()
     assert len(train) >= 20
     assert (df["target_source"] == "liquid_long_data.extracellular_yield_g_per_l").sum() > 0
+    assert "liquid_label_excel_order_inferred" not in set(train["target_match_method"].dropna())
+    assert (df["exclusion_reason"] == "low_confidence_liquid_target_match").sum() > 0
     assert "liquid_label_sequence_fallback" not in set(df["target_match_method"].dropna())

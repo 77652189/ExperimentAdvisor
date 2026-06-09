@@ -96,6 +96,10 @@ def compare_recommenders(
         recommendations[method_key] = bo_result["recommendations"]
         result["model_info"]["fitted_standard_bo_gp"] = bo_result["fitted_gp"]
         result["model_info"]["standard_bo_feature_cols"] = bo_result["feature_cols"]
+        result["model_info"]["standard_bo_model_feature_cols"] = bo_result.get(
+            "model_feature_cols",
+            bo_result["feature_cols"],
+        )
         result["strategy_quality"] = evaluate_recommendation_quality(
             recommendations[method_key],
             history,

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import sys
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -14,8 +16,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from experiment_advisor.ingestion.run_level import TARGET_COL, training_view
+from experiment_advisor.ingestion.run_level import TARGET_COL, add_model_derived_features, training_view
 from experiment_advisor.optimizer.search_space import SearchSpace
+from experiment_advisor.recommendation.pichia import (
+    METHOD_COUPLING_DEFAULTS,
+    PICHIA_PARAMETER_SPECS,
+    PICHIA_TARGET_COL,
+    analyze_pichia_doe_feedback,
+    empty_pichia_template,
+    pichia_template_columns,
+    recommend_pichia_design,
+    two_factor_design_matrix,
+    two_factor_doe_levels,
+    uniform_single_variable_levels,
+)
 import experiment_advisor.recommendation.service as recommendation_service
 from experiment_advisor.recommendation.quality import evaluate_recommendation_quality
 from experiment_advisor.report import generate_recommendation_report
@@ -61,6 +75,19 @@ FLAG_LABELS = {
     "high_residual_uncertainty": "不确定性较高",
 }
 
+RECOMMENDATION_CACHE_VERSION = "raw-bo-v1"
+RECOMMENDATION_CACHE_KEY = "recommendation_result_cache"
+
+PICHIA_DATA_DIR = PROJECT_ROOT / "data" / "pichia"
+PICHIA_UPLOAD_DIR = PICHIA_DATA_DIR / "uploads"
+PICHIA_FINAL_DIR = PICHIA_DATA_DIR / "final"
+PICHIA_TEMPLATE_DIR = PICHIA_DATA_DIR / "templates"
+PICHIA_DEFAULT_DATASET_PATH = PICHIA_FINAL_DIR / "pichia_run_level_dataset.csv"
+PICHIA_TEMPLATE_PATH = PICHIA_TEMPLATE_DIR / "pichia_run_level_template.csv"
+PICHIA_BASELINE_SOURCES = ["同菌种历史最优", "同菌种最近成功实验", "亲本菌种历史最优", "手动输入"]
+PICHIA_VARIABLE_LABELS = {name: spec.label for name, spec in PICHIA_PARAMETER_SPECS.items()}
+PICHIA_VARIABLE_KEYS_BY_LABEL = {label: name for name, label in PICHIA_VARIABLE_LABELS.items()}
+
 
 def _load_field_labels() -> dict[str, str]:
     dictionary_path = PROJECT_ROOT / "summary" / "supporting_reports" / "field_dictionary.csv"
@@ -84,6 +111,55 @@ def _compare_recommenders(df: pd.DataFrame, top_k: int, seed: int, method: str =
 
 def _recommendation_pool_size(top_k: int, multiplier: int = 3) -> int:
     return min(max(top_k * multiplier, top_k), 40)
+
+
+def _dataset_fingerprint(df: pd.DataFrame) -> str:
+    frame = df.copy()
+    frame.columns = frame.columns.map(str)
+    frame = frame.reindex(sorted(frame.columns), axis=1)
+
+    digest = hashlib.sha256()
+    digest.update(RECOMMENDATION_CACHE_VERSION.encode("utf-8"))
+    digest.update(str(frame.shape).encode("utf-8"))
+    digest.update("\0".join(frame.columns).encode("utf-8"))
+    try:
+        row_hash = pd.util.hash_pandas_object(frame, index=True).values
+    except TypeError:
+        row_hash = pd.util.hash_pandas_object(frame.astype(str), index=True).values
+    digest.update(row_hash.tobytes())
+    return digest.hexdigest()
+
+
+def _read_recommendation_cache(state: Any, dataset_fingerprint: str) -> dict[str, Any] | None:
+    cache = state.get(RECOMMENDATION_CACHE_KEY)
+    if not isinstance(cache, dict):
+        return None
+    if cache.get("version") != RECOMMENDATION_CACHE_VERSION:
+        return None
+    if cache.get("dataset_fingerprint") != dataset_fingerprint:
+        return None
+    if not cache.get("comparison"):
+        return None
+    return cache
+
+
+def _write_recommendation_cache(
+    state: Any,
+    *,
+    dataset_fingerprint: str,
+    comparison: dict[str, Any],
+    report_md: str,
+    report_path: Path,
+    run_settings: dict[str, Any],
+) -> None:
+    state[RECOMMENDATION_CACHE_KEY] = {
+        "version": RECOMMENDATION_CACHE_VERSION,
+        "dataset_fingerprint": dataset_fingerprint,
+        "comparison": comparison,
+        "report_md": report_md,
+        "report_path": str(report_path),
+        "run_settings": run_settings,
+    }
 
 
 def _ensure_strategy_quality(comparison: dict[str, Any], df: pd.DataFrame, feature_cols: list[str]) -> dict[str, Any]:
@@ -784,7 +860,8 @@ def _loocv_scatter(df: pd.DataFrame, feature_cols: list[str]) -> None:
         st.info("无可用特征列。")
         return
 
-    train = _training_data(df)[feature_cols + [TARGET_COL]].dropna()
+    feature_df = add_model_derived_features(_training_data(df))
+    train = feature_df[feature_cols + [TARGET_COL]].dropna()
     if len(train) < 8:
         st.info("训练数据不足（至少需要 8 条），无法计算 LOO-CV。")
         return
@@ -1013,9 +1090,586 @@ def _metric_explanations() -> None:
     st.dataframe(pd.DataFrame(standard_rows), width="stretch", hide_index=True)
 
 
+def _ensure_pichia_data_area() -> None:
+    for directory in [PICHIA_UPLOAD_DIR, PICHIA_FINAL_DIR, PICHIA_TEMPLATE_DIR]:
+        directory.mkdir(parents=True, exist_ok=True)
+    if not PICHIA_TEMPLATE_PATH.exists():
+        empty_pichia_template().to_csv(PICHIA_TEMPLATE_PATH, index=False, encoding="utf-8-sig")
+
+
+def _load_pichia_default_dataset() -> pd.DataFrame:
+    _ensure_pichia_data_area()
+    if not PICHIA_DEFAULT_DATASET_PATH.exists():
+        return empty_pichia_template()
+    return pd.read_csv(PICHIA_DEFAULT_DATASET_PATH)
+
+
+def _load_pichia_uploaded_dataset(uploaded_file: Any) -> tuple[pd.DataFrame, Path]:
+    _ensure_pichia_data_area()
+    payload = uploaded_file.getvalue()
+    safe_name = Path(uploaded_file.name).name or "pichia_uploaded.csv"
+    target_path = PICHIA_UPLOAD_DIR / safe_name
+    target_path.write_bytes(payload)
+    return pd.read_csv(BytesIO(payload)), target_path
+
+
+def _pichia_strain_options(df: pd.DataFrame) -> list[str]:
+    if "strain_id" not in df.columns:
+        return []
+    values = df["strain_id"].dropna().astype(str).str.strip()
+    return sorted(value for value in values.unique().tolist() if value)
+
+
+def _pichia_overview(df: pd.DataFrame, data_path: Path | None) -> None:
+    st.markdown("### 毕赤酵母历史数据")
+    if data_path:
+        st.caption(f"当前数据文件：{data_path}")
+    st.caption(f"Pichia 上传目录：{PICHIA_UPLOAD_DIR}")
+
+    strains = _pichia_strain_options(df)
+    cols = st.columns(4)
+    cols[0].metric("历史 run 数", len(df))
+    cols[1].metric("菌种数", len(strains))
+    cols[2].metric("有产量记录 run", int(pd.to_numeric(df.get(PICHIA_TARGET_COL, pd.Series(dtype=float)), errors="coerce").notna().sum()))
+    cols[3].metric("推荐方式", "序贯 DOE + 基准点")
+
+    missing = [name for name in pichia_template_columns() if name not in df.columns]
+    if missing and not df.empty:
+        st.warning(f"当前数据缺少模板字段：{', '.join(missing)}")
+    if df.empty:
+        st.info("当前 Pichia 历史数据为空。可上传 CSV，或使用手动基准点生成 2-4 罐早期探索方案。")
+        return
+
+    preview_cols = [column for column in pichia_template_columns() if column in df.columns]
+    with st.expander("Pichia 数据预览", expanded=False):
+        st.dataframe(df[preview_cols].head(30), width="stretch", hide_index=True)
+
+
+def _pichia_manual_baseline_inputs() -> dict[str, float]:
+    manual_baseline: dict[str, float] = {}
+    with st.expander("手动基准点", expanded=True):
+        columns = st.columns(2)
+        for index, (name, spec) in enumerate(PICHIA_PARAMETER_SPECS.items()):
+            with columns[index % 2]:
+                midpoint = _num((spec.lower + spec.upper) / 2.0)
+                number_format = "%.2f" if spec.step < 0.1 else "%.1f" if spec.step < 1 else "%.0f"
+                manual_baseline[name] = float(
+                    st.number_input(
+                        f"{spec.label}{f' ({spec.unit})' if spec.unit else ''}",
+                        min_value=float(spec.lower),
+                        max_value=float(spec.upper),
+                        value=float(midpoint),
+                        step=float(spec.step),
+                        format=number_format,
+                        key=f"pichia_manual_{name}",
+                    )
+                )
+    return manual_baseline
+
+
+def _pichia_recommendation_frame(result: dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    for item in result.get("recommendations", []):
+        row = {"排序": item.get("rank")}
+        for name, spec in PICHIA_PARAMETER_SPECS.items():
+            row[f"{spec.label}{f' ({spec.unit})' if spec.unit else ''}"] = _num(item.get("params", {}).get(name))
+        rows.append(row)
+    return _drop_empty_columns(pd.DataFrame(rows))
+
+
+def _pichia_baseline_frame(result: dict[str, Any]) -> pd.DataFrame:
+    baseline = result.get("baseline") or {}
+    rows = []
+    for name, spec in PICHIA_PARAMETER_SPECS.items():
+        rows.append(
+            {
+                "参数": spec.label,
+                "字段": name,
+                "基准值": _num(baseline.get(name)),
+                "硬约束下限": spec.lower,
+                "硬约束上限": spec.upper,
+                "单位": spec.unit,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _pichia_exploration_metrics(result: dict[str, Any]) -> None:
+    metrics = result.get("exploration_metrics") or {}
+    st.markdown("### 探索反馈指标")
+    overall = pd.DataFrame(
+        [
+            {"指标": "平均每个推荐改变变量数", "数值": _num(metrics.get("average_changed_variables"))},
+            {"指标": "单变量性", "数值": _num(metrics.get("univariate_score"))},
+            {"指标": "联合探索性", "数值": _num(metrics.get("joint_exploration_score"))},
+            {"指标": "批内平均距离", "数值": _num(metrics.get("mean_pairwise_distance"))},
+            {"指标": "批内多样性", "数值": metrics.get("batch_diversity")},
+        ]
+    )
+    st.dataframe(overall, width="stretch", hide_index=True)
+
+    variable_rows = []
+    for row in metrics.get("variables", []):
+        rec_min = row.get("min")
+        rec_max = row.get("max")
+        variable_rows.append(
+            {
+                "变量": row.get("label"),
+                "变化次数": f"{row.get('changed_count')}/{row.get('n_recommendations')}",
+                "推荐变化范围": "未变化" if rec_min is None else f"{_num(rec_min)} - {_num(rec_max)}",
+                "允许范围": f"{_num(row.get('allowed_lower'))} - {_num(row.get('allowed_upper'))}",
+                "覆盖比例": _num(row.get("coverage")),
+            }
+        )
+    st.dataframe(pd.DataFrame(variable_rows), width="stretch", hide_index=True)
+
+
+def _pichia_information_gain_block(result: dict[str, Any]) -> bool:
+    info = result.get("information_gain") or {}
+    if not info:
+        return False
+    st.markdown("### DOE 信息增益")
+    rows = [
+        {"项目": "设计类型", "说明": info.get("design_type")},
+        {"项目": "主动变量", "说明": " × ".join(info.get("active_variable_labels", []))},
+        {"项目": "可估计主效应", "说明": "是" if info.get("can_estimate_main_effects") else "否"},
+        {"项目": "可估计交互效应", "说明": "是" if info.get("can_estimate_interaction") else "否"},
+        {"项目": "可估计项", "说明": "；".join(info.get("estimable_terms", []))},
+        {"项目": "相比单变量", "说明": info.get("vs_single_variable")},
+        {"项目": "下一轮反馈规则", "说明": info.get("next_round_rule")},
+    ]
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    return True
+
+
+def _pichia_feedback_input_frame(result: dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    active_variables = (result.get("doe") or {}).get("active_variables") or []
+    for item in result.get("recommendations", []):
+        row = {"排序": item.get("rank"), "实测产量": None}
+        for variable in active_variables:
+            spec = PICHIA_PARAMETER_SPECS[variable]
+            row[spec.label] = _num(item.get("params", {}).get(variable))
+        rows.append(row)
+    columns = ["排序", *[PICHIA_PARAMETER_SPECS[name].label for name in active_variables], "实测产量"]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _pichia_suggested_baseline_frame(feedback: dict[str, Any]) -> pd.DataFrame:
+    baseline = feedback.get("suggested_baseline") or {}
+    rows = []
+    for name, spec in PICHIA_PARAMETER_SPECS.items():
+        rows.append(
+            {
+                "参数": spec.label,
+                "建议基准值": _num(baseline.get(name)),
+                "单位": spec.unit,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _pichia_doe_feedback_block(result: dict[str, Any]) -> None:
+    if result.get("mode") != "pichia_sequential_doe":
+        return
+
+    st.markdown("### 实验结果反馈")
+    st.caption("实验完成后回填每罐实测产量，用于计算主效应、交互效应和下一轮 DOE 建议。")
+    threshold = st.number_input(
+        "有意义产量差阈值",
+        min_value=0.0,
+        max_value=1000.0,
+        value=0.05,
+        step=0.01,
+        help="低于该阈值的产量差视为无明显信号，避免把实验噪声解释成方向。",
+        key="pichia_feedback_threshold",
+    )
+
+    feedback_frame = _pichia_feedback_input_frame(result)
+    if feedback_frame.empty:
+        st.info("当前结果不是可反馈的 DOE 设计。")
+        return
+    disabled_columns = [column for column in feedback_frame.columns if column != "实测产量"]
+    edited = st.data_editor(
+        feedback_frame,
+        width="stretch",
+        hide_index=True,
+        disabled=disabled_columns,
+        key="pichia_feedback_yields",
+    )
+    observed_yields = {
+        int(row["排序"]): row.get("实测产量")
+        for _, row in edited.iterrows()
+    }
+    feedback = analyze_pichia_doe_feedback(
+        result,
+        observed_yields,
+        practical_threshold=float(threshold),
+    )
+
+    if feedback.get("status") == "insufficient":
+        st.info(feedback.get("message", "请先回填实测产量。"))
+        return
+
+    cols = st.columns(3)
+    cols[0].metric("已回填罐数", f"{feedback.get('completed_count')}/{feedback.get('total_count')}")
+    cols[1].metric("最高产排序", feedback.get("best_rank"))
+    cols[2].metric("最高实测产量", _num(feedback.get("best_yield")))
+
+    effect_rows = []
+    for item in feedback.get("main_effects", []):
+        effect_rows.append(
+            {
+                "变量": item.get("label"),
+                "低水平均值": _num(item.get("low_mean")),
+                "高水平均值": _num(item.get("high_mean")),
+                "主效应": _num(item.get("effect")),
+                "判断": item.get("direction"),
+                "样本数": f"{item.get('n_low')}/{item.get('n_high')}",
+            }
+        )
+    st.dataframe(pd.DataFrame(effect_rows), width="stretch", hide_index=True)
+
+    interaction = feedback.get("interaction_effect") or {}
+    if interaction.get("can_estimate"):
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "项目": "交互效应",
+                        "效应值": _num(interaction.get("effect")),
+                        "判断": interaction.get("direction"),
+                    }
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.info("当前回填不足 4 个 DOE 组合，暂不能估计交互效应。")
+
+    st.success(feedback.get("suggestion"))
+    with st.expander("建议下一轮基准点", expanded=False):
+        st.dataframe(_pichia_suggested_baseline_frame(feedback), width="stretch", hide_index=True)
+
+
+def _pichia_result_block(result: dict[str, Any]) -> None:
+    baseline_meta = result.get("baseline_meta") or {}
+    if baseline_meta.get("warning"):
+        st.warning(str(baseline_meta["warning"]))
+
+    st.markdown("### 基准点")
+    cols = st.columns(4)
+    cols[0].metric("菌种 ID", result.get("strain_id") or "未填写")
+    cols[1].metric("亲本菌种", result.get("parent_strain_id") or "无")
+    cols[2].metric("基准来源", baseline_meta.get("source", ""))
+    cols[3].metric("每个推荐改变变量数", result.get("changed_variable_count"))
+    st.dataframe(_pichia_baseline_frame(result), width="stretch", hide_index=True)
+
+    st.markdown("### 推荐组合")
+    recommendations = result.get("recommendations", [])
+    if not recommendations:
+        st.info("暂无 Pichia 推荐结果。")
+        return
+    st.dataframe(_pichia_recommendation_frame(result), width="stretch", hide_index=True)
+
+    if not _pichia_information_gain_block(result):
+        _pichia_exploration_metrics(result)
+    _pichia_doe_feedback_block(result)
+
+
+def _pichia_design_page() -> None:
+    _ensure_pichia_data_area()
+    st.caption("当前模式：毕赤酵母序贯 DOE。此模式不使用大肠杆菌 BO 模型，围绕基准点设计可解释的下一批实验。")
+
+    with st.sidebar:
+        st.header("毕赤酵母数据入口")
+        source = st.radio(
+            "选择数据来源",
+            ["使用 data/pichia/final/pichia_run_level_dataset.csv", "上传 Pichia run-level CSV"],
+            key="pichia_data_source",
+        )
+        uploaded_file = None
+        if source == "上传 Pichia run-level CSV":
+            uploaded_file = st.file_uploader("上传 Pichia run-level CSV", type=["csv"], key="pichia_uploaded_csv")
+        template_csv = empty_pichia_template().to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "下载 Pichia 数据模板",
+            data=template_csv,
+            file_name="pichia_run_level_template.csv",
+            mime="text/csv",
+            key="download_pichia_template",
+        )
+
+    try:
+        if source == "上传 Pichia run-level CSV":
+            if uploaded_file is None:
+                df = empty_pichia_template()
+                data_path = None
+            else:
+                df, data_path = _load_pichia_uploaded_dataset(uploaded_file)
+        else:
+            df = _load_pichia_default_dataset()
+            data_path = PICHIA_DEFAULT_DATASET_PATH if PICHIA_DEFAULT_DATASET_PATH.exists() else None
+    except Exception as exc:
+        st.error(f"Pichia 数据加载失败：{exc}")
+        return
+
+    _pichia_overview(df, data_path)
+    pichia_fingerprint = _dataset_fingerprint(df)
+    strain_options = _pichia_strain_options(df)
+
+    with st.sidebar:
+        st.header("实验上下文")
+        if strain_options:
+            strain_choice = st.selectbox("菌种 ID", [*strain_options, "手动输入新菌种"], key="pichia_strain_choice")
+            strain_id = (
+                st.text_input("新菌种 ID", key="pichia_strain_manual").strip()
+                if strain_choice == "手动输入新菌种"
+                else strain_choice
+            )
+            parent_choice = st.selectbox("亲本菌种 ID", ["无", *strain_options, "手动输入"], key="pichia_parent_choice")
+            if parent_choice == "手动输入":
+                parent_strain_id = st.text_input("亲本菌种 ID（手动）", key="pichia_parent_manual").strip() or None
+            elif parent_choice == "无":
+                parent_strain_id = None
+            else:
+                parent_strain_id = parent_choice
+        else:
+            strain_id = st.text_input("菌种 ID", key="pichia_strain_manual_empty").strip()
+            parent_strain_id = st.text_input("亲本菌种 ID（可选）", key="pichia_parent_manual_empty").strip() or None
+
+    st.markdown("### 实验设计设置")
+    settings_col, input_col = st.columns([0.9, 1.1])
+    with settings_col:
+        method = st.selectbox("实验方法", list(METHOD_COUPLING_DEFAULTS), index=0, key="pichia_experiment_method")
+        n_recommendations = st.slider("推荐罐数", min_value=2, max_value=4, value=4, key="pichia_n_recommendations")
+        baseline_source = st.selectbox(
+            "基准点来源",
+            PICHIA_BASELINE_SOURCES,
+            index=3 if df.empty else 0,
+            key="pichia_baseline_source",
+        )
+        if method == "序贯 DOE（2因子）":
+            coupling = 0.5
+            seed = 0
+            st.caption("4 罐为完整 2×2 DOE，可同时估计两个主效应和一次交互效应。")
+        elif method == "单变量验证":
+            coupling = 0.0
+            seed = 0
+            st.caption("单变量验证按探索区间等距取点，不使用随机种子。")
+        else:
+            coupling = st.slider(
+                "探索耦合度",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(METHOD_COUPLING_DEFAULTS[method]),
+                step=0.01,
+                help="0.0 接近单变量法；1.0 为所有可探索变量联合变化。",
+                key=f"pichia_coupling_{method}",
+            )
+            seed = st.number_input("设计随机种子", min_value=0, max_value=9999, value=0, step=1, key="pichia_seed")
+
+    with input_col:
+        manual_baseline = _pichia_manual_baseline_inputs() if baseline_source == "手动输入" else {}
+        variable_labels = list(PICHIA_VARIABLE_KEYS_BY_LABEL)
+        doe_variables = None
+        doe_bounds = None
+        single_variable = None
+        single_variable_bounds = None
+        intensities = {}
+        if method == "序贯 DOE（2因子）":
+            default_a = "生长期 pH"
+            default_b = "生产期 pH"
+            factor_a_label = st.selectbox(
+                "主动变量 A",
+                variable_labels,
+                index=variable_labels.index(default_a) if default_a in variable_labels else 0,
+                key="pichia_doe_factor_a",
+            )
+            factor_b_options = [label for label in variable_labels if label != factor_a_label]
+            factor_b_label = st.selectbox(
+                "主动变量 B",
+                factor_b_options,
+                index=factor_b_options.index(default_b) if default_b in factor_b_options else 0,
+                key="pichia_doe_factor_b",
+            )
+            doe_variables = [
+                PICHIA_VARIABLE_KEYS_BY_LABEL[factor_a_label],
+                PICHIA_VARIABLE_KEYS_BY_LABEL[factor_b_label],
+            ]
+            doe_bounds = {}
+            for variable in doe_variables:
+                spec = PICHIA_PARAMETER_SPECS[variable]
+                st.markdown(f"**{spec.label} DOE 水平**")
+                bound_cols = st.columns(2)
+                number_format = "%.2f" if spec.step < 0.1 else "%.1f" if spec.step < 1 else "%.0f"
+                with bound_cols[0]:
+                    lower = st.number_input(
+                        "低水平",
+                        min_value=float(spec.lower),
+                        max_value=float(spec.upper),
+                        value=float(spec.lower),
+                        step=float(spec.step),
+                        format=number_format,
+                        key=f"pichia_doe_lower_{variable}",
+                    )
+                with bound_cols[1]:
+                    upper = st.number_input(
+                        "高水平",
+                        min_value=float(spec.lower),
+                        max_value=float(spec.upper),
+                        value=float(spec.upper),
+                        step=float(spec.step),
+                        format=number_format,
+                        key=f"pichia_doe_upper_{variable}",
+                    )
+                doe_bounds[variable] = (float(lower), float(upper))
+
+            try:
+                levels = {
+                    variable: two_factor_doe_levels(variable, *doe_bounds[variable])
+                    for variable in doe_variables
+                }
+                preview_rows = []
+                for rank, (code_a, code_b) in enumerate(two_factor_design_matrix(int(n_recommendations)), start=1):
+                    preview_rows.append(
+                        {
+                            "排序": rank,
+                            PICHIA_PARAMETER_SPECS[doe_variables[0]].label: levels[doe_variables[0]]["high" if code_a > 0 else "low"],
+                            PICHIA_PARAMETER_SPECS[doe_variables[1]].label: levels[doe_variables[1]]["high" if code_b > 0 else "low"],
+                        }
+                    )
+                st.dataframe(pd.DataFrame(preview_rows), width="stretch", hide_index=True)
+            except ValueError as exc:
+                st.warning(str(exc))
+            variables = doe_variables
+        elif method == "单变量验证":
+            single_label = st.selectbox("单变量验证对象", variable_labels, key="pichia_single_variable_label")
+            single_variable = PICHIA_VARIABLE_KEYS_BY_LABEL[single_label]
+            spec = PICHIA_PARAMETER_SPECS[single_variable]
+            bound_cols = st.columns(2)
+            number_format = "%.2f" if spec.step < 0.1 else "%.1f" if spec.step < 1 else "%.0f"
+            with bound_cols[0]:
+                single_lower = st.number_input(
+                    f"{spec.label}探索下限",
+                    min_value=float(spec.lower),
+                    max_value=float(spec.upper),
+                    value=float(spec.lower),
+                    step=float(spec.step),
+                    format=number_format,
+                    key=f"pichia_single_lower_{single_variable}",
+                )
+            with bound_cols[1]:
+                single_upper = st.number_input(
+                    f"{spec.label}探索上限",
+                    min_value=float(spec.lower),
+                    max_value=float(spec.upper),
+                    value=float(spec.upper),
+                    step=float(spec.step),
+                    format=number_format,
+                    key=f"pichia_single_upper_{single_variable}",
+                )
+            single_variable_bounds = (float(single_lower), float(single_upper))
+            levels = uniform_single_variable_levels(
+                single_variable,
+                int(n_recommendations),
+                lower=float(single_lower),
+                upper=float(single_upper),
+            )
+            st.caption(
+                "本次单变量水平："
+                + "，".join(str(_num(value)) for value in levels)
+                + "；其他参数保持基准点不变。"
+            )
+            variables = [single_variable]
+        else:
+            selected_labels = st.multiselect(
+                "可探索变量",
+                variable_labels,
+                default=variable_labels,
+                key="pichia_variables",
+            )
+            variables = [PICHIA_VARIABLE_KEYS_BY_LABEL[label] for label in selected_labels]
+            with st.expander("每个变量探索强度", expanded=True):
+                for label in selected_labels:
+                    key = PICHIA_VARIABLE_KEYS_BY_LABEL[label]
+                    intensities[key] = st.selectbox(
+                        f"{label}",
+                        ["低", "中", "高"],
+                        index=1,
+                        key=f"pichia_intensity_{key}",
+                    )
+
+    run_button = st.button("生成 Pichia 推荐", type="primary", width="stretch")
+
+    if not strain_id:
+        st.warning("请先在左侧填写或选择菌种 ID。")
+        return
+
+    if run_button:
+        try:
+            result = recommend_pichia_design(
+                df,
+                strain_id=strain_id,
+                parent_strain_id=parent_strain_id,
+                baseline_source=baseline_source,
+                manual_baseline=manual_baseline if baseline_source == "手动输入" else None,
+                variables=variables,
+                intensities=intensities,
+                coupling=float(coupling),
+                doe_variables=doe_variables,
+                doe_bounds=doe_bounds,
+                single_variable=single_variable,
+                single_variable_bounds=single_variable_bounds,
+                n_recommendations=int(n_recommendations),
+                seed=int(seed),
+                target_col=PICHIA_TARGET_COL,
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+        st.session_state["pichia_design_result"] = result
+        st.session_state["pichia_design_settings"] = {
+            "dataset_fingerprint": pichia_fingerprint,
+            "strain_id": strain_id,
+            "parent_strain_id": parent_strain_id,
+            "method": method,
+            "baseline_source": baseline_source,
+            "coupling": float(coupling),
+            "doe_variables": doe_variables,
+            "doe_bounds": doe_bounds,
+            "single_variable": single_variable,
+            "single_variable_bounds": single_variable_bounds,
+            "n_recommendations": int(n_recommendations),
+            "seed": int(seed),
+        }
+        st.success("Pichia 推荐已生成")
+    else:
+        settings = st.session_state.get("pichia_design_settings") or {}
+        result = (
+            st.session_state.get("pichia_design_result")
+            if settings.get("dataset_fingerprint") == pichia_fingerprint
+            else None
+        )
+        if result is None:
+            st.info("设置左侧参数后点击“生成 Pichia 推荐”。当前阶段推荐用于设计可执行探索实验，不用于宣称最优点。")
+            return
+        st.caption("当前显示上一次生成的 Pichia 推荐；点击左侧按钮会按当前设置重新生成。")
+
+    _pichia_result_block(result)
+
+
 def main() -> None:
     st.set_page_config(page_title="发酵工艺优化推荐系统", layout="wide")
     st.title("发酵工艺优化推荐系统")
+    with st.sidebar:
+        mode = st.radio("推荐模式", ["大肠杆菌 BO", "毕赤酵母早期实验设计"], key="recommendation_mode")
+
+    if mode == "毕赤酵母早期实验设计":
+        _pichia_design_page()
+        return
+
     st.caption("主方法：标准 GP-BO（qNEI），使用 BoTorch 联合优化批量推荐。")
 
     with st.sidebar:
@@ -1109,6 +1763,9 @@ def main() -> None:
         return
 
     _overview(df)
+    dataset_fingerprint = _dataset_fingerprint(df)
+    report_path = PROJECT_ROOT / "summary" / "recommendation_report.md"
+    cache_message = ""
     if run_button:
         with st.spinner("正在训练标准 GP-BO（qNEI）并生成推荐..."):
             pool_size = _recommendation_pool_size(top_k, candidate_pool_multiplier) if enable_soft_filter else int(top_k)
@@ -1134,48 +1791,70 @@ def main() -> None:
                     feature_cols_for_filter,
                     target_count=int(top_k),
                 )
-            report_path = PROJECT_ROOT / "summary" / "recommendation_report.md"
+            run_settings = {
+                "top_k": int(top_k),
+                "pool_size": int(pool_size),
+                "seed": int(seed),
+                "method": _method_arg,
+                "soft_filter_enabled": bool(enable_soft_filter),
+                "candidate_pool_multiplier": int(candidate_pool_multiplier),
+                "max_nearest_history_distance": float(max_nearest_history_distance),
+                "max_boundary_risk": float(max_boundary_risk),
+                "history_sigma": float(history_sigma),
+            }
+            comparison["run_settings"] = run_settings
             report_md = generate_recommendation_report(comparison, output_path=report_path)
+            _write_recommendation_cache(
+                st.session_state,
+                dataset_fingerprint=dataset_fingerprint,
+                comparison=comparison,
+                report_md=report_md,
+                report_path=report_path,
+                run_settings=run_settings,
+            )
         st.session_state["recommendation_comparison"] = comparison
         st.session_state["recommendation_report_md"] = report_md
         st.session_state["recommendation_report_path"] = str(report_path)
-    elif "recommendation_comparison" in st.session_state:
-        comparison = st.session_state["recommendation_comparison"]
-        report_md = st.session_state.get("recommendation_report_md", "")
-        report_path = Path(st.session_state.get("recommendation_report_path", PROJECT_ROOT / "summary" / "recommendation_report.md"))
+        cache_message = "已重新训练并更新缓存。"
     else:
-        st.info("点击左侧“运行推荐”后，系统会训练模型、生成候选点，并输出诊断信息。")
-        return
+        cached = _read_recommendation_cache(st.session_state, dataset_fingerprint)
+        if cached:
+            comparison = cached["comparison"]
+            report_md = cached.get("report_md", "")
+            report_path = Path(cached.get("report_path", str(report_path)))
+            st.session_state["recommendation_comparison"] = comparison
+            st.session_state["recommendation_report_md"] = report_md
+            st.session_state["recommendation_report_path"] = str(report_path)
+            cache_message = "已自动读取缓存结果；只有点击“运行推荐”才会重新训练。"
+        else:
+            st.info("当前数据没有可用推荐缓存。点击左侧“运行推荐”后，系统会训练模型、生成候选点，并缓存本次结果。")
+            return
 
     selected_method = comparison.get("selected_method", "standard_bo_qnei")
     selected = comparison.get("selected_recommendations", [])
     decision = comparison.get("decision", {})
     fitted_gp = comparison.get("model_info", {}).get("fitted_standard_bo_gp")
     feature_cols = comparison.get("model_info", {}).get("standard_bo_feature_cols", [])
-    comparison["soft_filter_enabled"] = bool(enable_soft_filter)
-    if enable_soft_filter:
-        comparison = _apply_soft_filters(
-            comparison,
-            df,
-            feature_cols,
-            max_nearest_history_distance=float(max_nearest_history_distance),
-            max_boundary_risk=float(max_boundary_risk),
-            history_sigma=float(history_sigma),
-            target_count=int(comparison.get("requested_top_k", top_k)),
-        )
-    else:
-        comparison = _select_without_soft_filters(
-            comparison,
-            df,
-            feature_cols,
-            target_count=int(comparison.get("requested_top_k", top_k)),
-        )
+    model_feature_cols = comparison.get("model_info", {}).get("standard_bo_model_feature_cols", feature_cols)
     selected = comparison.get("selected_recommendations", [])
-    report_md = generate_recommendation_report(comparison, output_path=report_path)
-    st.session_state["recommendation_comparison"] = comparison
-    st.session_state["recommendation_report_md"] = report_md
+    if not report_md:
+        report_md = generate_recommendation_report(comparison, output_path=report_path)
+        st.session_state["recommendation_report_md"] = report_md
 
     st.success("推荐已生成")
+    if cache_message:
+        st.caption(cache_message)
+    run_settings = comparison.get("run_settings") or {}
+    if run_settings:
+        st.caption(
+            "当前结果参数：方法 {method}，推荐数 {top_k}，候选池 {pool_size}，随机种子 {seed}，软过滤 {soft_filter}。".format(
+                method=run_settings.get("method"),
+                top_k=run_settings.get("top_k"),
+                pool_size=run_settings.get("pool_size"),
+                seed=run_settings.get("seed"),
+                soft_filter="启用" if run_settings.get("soft_filter_enabled") else "未启用",
+            )
+        )
     cols = st.columns(2)
     cols[0].metric("主推荐方法", METHOD_LABELS.get(selected_method, selected_method))
     cols[1].metric("训练 run 数", comparison.get("n_training_rows"))
@@ -1228,7 +1907,7 @@ def main() -> None:
     with tabs[1]:
         st.markdown("### LOO-CV 模型泛化能力")
         st.caption("验证 GP 模型是否能预测它没见过的实验结果。这是判断推荐可信度的核心依据。")
-        _loocv_scatter(df, feature_cols)
+        _loocv_scatter(df, model_feature_cols)
     with tabs[2]:
         _strategy_quality_block(comparison, df, selected, feature_cols)
     with tabs[3]:

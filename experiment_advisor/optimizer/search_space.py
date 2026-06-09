@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from experiment_advisor.ingestion.run_level import CONTROL_FEATURES, MODEL_FEATURES
+from experiment_advisor.ingestion.run_level import CONTROL_FEATURES, RECOMMENDATION_FEATURES
 
 
 @dataclass(frozen=True)
@@ -19,7 +19,7 @@ def build_search_space_from_history(
 ) -> SearchSpace:
     """从历史数据分位数构建保守搜索空间，可用 overrides 覆盖边界。"""
 
-    features = feature_cols or [column for column in MODEL_FEATURES if column in df.columns]
+    features = feature_cols or [column for column in RECOMMENDATION_FEATURES if column in df.columns]
     bounds: dict[str, tuple[float, float]] = {}
     for column in features:
         values = pd.to_numeric(df[column], errors="coerce").dropna()
@@ -31,7 +31,11 @@ def build_search_space_from_history(
             low -= 0.5
             high += 0.5
         padding = (high - low) * 0.05
-        bounds[column] = (low - padding, high + padding)
+        padded_low = low - padding
+        padded_high = high + padding
+        if column.endswith("_ml") or column.endswith("_time_h"):
+            padded_low = max(0.0, padded_low)
+        bounds[column] = (padded_low, padded_high)
     if overrides:
         bounds.update({name: (float(low), float(high)) for name, (low, high) in overrides.items()})
     if not bounds:

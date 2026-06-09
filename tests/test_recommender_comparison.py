@@ -15,6 +15,7 @@ def _synthetic_df(n: int = 16) -> pd.DataFrame:
         feed1 = 700 + i * 8
         feed2 = 80 + (i % 4) * 15
         lac_start = 20.0 + (i % 3) * 2.0
+        lac_after_48h = 0.0 if i % 5 == 0 else 120.0 + (i % 3) * 40.0
         y = (
             140.0
             - 2.0 * (shift_time - 20.0)
@@ -23,6 +24,7 @@ def _synthetic_df(n: int = 16) -> pd.DataFrame:
             + 0.02 * (feed1 - 700.0)
             - 0.10 * (feed2 - 80.0)
             - 0.30 * (lac_start - 20.0)
+            - 0.02 * lac_after_48h
         )
         rows.append(
             {
@@ -33,6 +35,7 @@ def _synthetic_df(n: int = 16) -> pd.DataFrame:
                 "feed1_total_ml": feed1,
                 "feed2_total_ml": feed2,
                 "lactose_first_add_time_h": lac_start,
+                "lactose_after_48h_ml": lac_after_48h,
                 "yield_g_per_l": y,
                 "exclude_from_training": False,
             }
@@ -64,6 +67,7 @@ def test_compare_recommenders_returns_standard_bo_qnei_primary():
     assert result["decision"]["selected_method"] == "standard_bo_qnei"
     assert result["strategy_quality"]["batch_diversity"]["n_recommendations"] == 3
     assert "mean_nearest_history_distance" in result["strategy_quality"]["history_support"]
+    assert "lactose_after_48h_log1p" in result["model_info"]["standard_bo_model_feature_cols"]
 
 
 def test_standard_bo_qnei_recommendations_are_batch_diverse_and_visualizable():
@@ -79,6 +83,8 @@ def test_standard_bo_qnei_recommendations_are_batch_diverse_and_visualizable():
 
     assert len(result["recommendations"]) == 5
     assert all(item["method"] == "standard_bo_qnei" for item in result["recommendations"])
+    assert all("lactose_after_48h_log1p" not in item["params"] for item in result["recommendations"])
+    assert "lactose_after_48h_log1p" in result["model_feature_cols"]
 
     param_sets = [
         frozenset(item["params"].items())

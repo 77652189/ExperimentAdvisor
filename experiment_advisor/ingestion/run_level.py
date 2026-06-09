@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 TARGET_COL = "yield_g_per_l"
@@ -41,18 +42,37 @@ CONTROL_FEATURES = [
 #   fermentation_duration_h     — Spearman r=-0.29（最弱），与 feed2_total_ml/temperature_shift_time_h
 #                                  高度混淆（r≈0.53）；短周期实验产量不低于长周期，
 #                                  时长是实验代次的代理变量而非独立工艺参数
-#   lactose_after_48h_ml        — Spearman r=-0.70，但与 temperature_shift_time_h 高度共线
-#                                  （两者均为实验年代代理变量）。加入后 BoTorch GP ARD 将
-#                                  temperature_shift_time_h 压平（length scale → ∞），
-#                                  LOO-CV 无改善（MAE 10.71 vs 10.74），净效果为负，回退。
-MODEL_FEATURES: list[str] = [
+# 当前重新纳入/派生的特征：
+#   lactose_after_48h_ml        — 残差诊断显示旧模型未吸收晚期乳糖补加策略；
+#                                  纳入后 Ridge LOO-CV R2 0.064 -> 0.301，
+#                                  sklearn GP LOO-CV R2 0.329 -> 0.354。
+#   lactose_after_48h_log1p     — 晚期补加量的连续压缩特征，保留 presence 信号；
+#                                  sklearn GP LOO-CV R2 0.354 -> 0.380。
+RECOMMENDATION_FEATURES: list[str] = [
     "temperature_shift_time_h",        # 产量最强预测因子：Spearman r=-0.55，高产组比低产组早 6.7 h
     "temperature_production_phase_c",  # Spearman r=0.51，独立可调的生产相温度
     "lactose_total_ml",                # Spearman r=-0.52，HMO 底物总量
     "feed1_total_ml",                  # Spearman r=0.38，主碳源补料量
     "feed2_total_ml",                  # Spearman r=-0.42，与乳糖竞争，与产量负相关
     "lactose_first_add_time_h",        # Pearson r=-0.39，乳糖首次添加时机，与时长独立性好
+    "lactose_after_48h_ml",            # 晚期乳糖补加策略信号；比派生比例/标志位更适合作为可执行推荐参数
 ]
+
+DERIVED_MODEL_FEATURES: list[str] = [
+    "lactose_after_48h_log1p",
+]
+
+MODEL_FEATURES: list[str] = [*RECOMMENDATION_FEATURES, *DERIVED_MODEL_FEATURES]
+
+
+def add_model_derived_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add deterministic model-only features while preserving raw recommendation columns."""
+
+    result = df.copy()
+    if "lactose_after_48h_ml" in result.columns:
+        values = pd.to_numeric(result["lactose_after_48h_ml"], errors="coerce").clip(lower=0)
+        result["lactose_after_48h_log1p"] = np.log1p(values)
+    return result
 
 
 def _read_csv(source_dir: Path, name: str) -> pd.DataFrame:
@@ -232,6 +252,8 @@ def _training_exclusion(row: dict[str, Any]) -> tuple[bool, str]:
         return True, "missing_yield"
     if row.get("event_has_abnormal_note"):
         return True, "abnormal_or_contamination_note"
+    if row.get("target_match_method") == "liquid_label_excel_order_inferred":
+        return True, "low_confidence_liquid_target_match"
     return False, ""
 
 
@@ -435,7 +457,7 @@ def build_run_level_dataset(
         row["exclusion_reason"] = reason
         rows.append(row)
 
-    result = pd.DataFrame(rows)
+    result = add_model_derived_features(pd.DataFrame(rows))
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(output, index=False, encoding="utf-8")

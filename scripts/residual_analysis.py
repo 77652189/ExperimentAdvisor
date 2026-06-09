@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -7,19 +10,14 @@ from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import LeaveOneOut
 
-df = pd.read_csv("data/final/run_level_modeling_dataset.csv")
-train = df[df["exclude_from_training"] == False].copy()
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-MODEL_FEATURES = [
-    "temperature_shift_time_h",
-    "temperature_production_phase_c",
-    "lactose_total_ml",
-    "feed1_total_ml",
-    "feed2_total_ml",
-    "lactose_first_add_time_h",
-]
+from experiment_advisor.ingestion.run_level import MODEL_FEATURES, add_model_derived_features
+
+df = add_model_derived_features(pd.read_csv("data/final/run_level_modeling_dataset.csv"))
+train = df[df["exclude_from_training"] == False].copy()
 TARGET = "yield_g_per_l"
-REMOVED = ["fermentation_duration_h", "lactose_after_48h_ml"]
+REMOVED = ["fermentation_duration_h"]
 
 train = train[MODEL_FEATURES + [TARGET] + REMOVED].dropna()
 print(f"Training rows: {len(train)}")
