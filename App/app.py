@@ -11,8 +11,12 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 from matplotlib import font_manager
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -22,14 +26,18 @@ from experiment_advisor.ingestion.run_level import TARGET_COL, add_model_derived
 from experiment_advisor.optimizer.search_space import SearchSpace
 from experiment_advisor.recommendation.round1_design import (
     BASELINE as PICHIA_ROUND1_BASELINE,
+    OFAT_LEVELS as PICHIA_OFAT_LEVELS,
+    count_round1_rows,
     generate_round1_design,
     round1_template_columns,
 )
 from experiment_advisor.recommendation.round2_design import (
     ALL_VARIABLES as PICHIA_VARIABLES,
     CONTINUOUS_BOUNDS as PICHIA_CONTINUOUS_BOUNDS,
+    FIXED_LEVELS as PICHIA_FIXED_LEVELS,
     OD_COL as PICHIA_OD_COL,
     TARGET_COL as PICHIA_TARGET_COL,
+    FactorEffect,
     plan_round2,
     recommend_round2_bo_batch,
 )
@@ -97,13 +105,32 @@ PICHIA_VARIABLE_LABELS = {
     "interval_h": "补料时间间隔 (h)",
 }
 
+# dataviz palette (dark-mode slots) -- see .claude/plans note on chart conventions:
+# fixed categorical order for run_type identity, one diverging pair for correlation,
+# accent-vs-muted "emphasis" pair for the effect-magnitude significance cutoff.
+PICHIA_RUN_TYPE_COLORS = {"baseline": "#3987e5", "ofat": "#d95926", "combo": "#199e70"}
+PICHIA_RUN_TYPE_LABELS = {"baseline": "基线重复", "ofat": "单变量(OFAT)", "combo": "联合探索"}
+PICHIA_DIVERGING_COLORSCALE = [[0, "#3987e5"], [0.5, "#383835"], [1, "#e66767"]]
+PICHIA_ACCENT_COLOR = "#3987e5"
+PICHIA_MUTED_COLOR = "#6b6a64"
+
 PICHIA_UI_CACHE_KEYS = {
     "recommendation_mode",
     "round2_bo_batch_size",
+    "round2_max_active_variables",
+    "round2_ccd_step_fraction",
+    "round2_od_threshold_fraction",
     "pichia_ui_design_records",
 }
 
 PICHIA_UI_CACHE_PREFIXES: tuple[str, ...] = ()
+# Note: round1_builder_* widget keys deliberately are NOT in the cross-session
+# cache -- they pass explicit value=/default=/index= defaults on every render,
+# which Streamlit forbids combining with a pre-populated session_state entry
+# (raises "widget created with a default value but also had its value set via
+# the Session State API"). They're normal per-session widget state instead;
+# the thing that actually needs to survive is the generated round1_results_df,
+# which is a plain session_state entry, not a cached widget key.
 
 
 def _load_field_labels() -> dict[str, str]:
@@ -1184,25 +1211,406 @@ def _pichia_variable_display(row: dict[str, Any]) -> dict[str, Any]:
     return {PICHIA_VARIABLE_LABELS.get(name, name): _num(row.get(name)) for name in PICHIA_VARIABLES if name in row}
 
 
-def _pichia_round1_tab() -> None:
-    _ensure_pichia_data_area()
-    st.markdown("### Round 1 设计（基线重复 + 单变量 + 联合探索，共 18 个样本）")
+def _pichia_round1_builder() -> None:
+    st.markdown("#### 方案配置")
     st.caption(
-        "设计逻辑：3 次基线重复用于估计批次噪声；11 行单变量(OFAT)，每次只改 1 个参数到方案给定的备选水平，"
-        "其余维持基线；4 行联合探索，4 个连续变量走拉丁超立方联合取值，温度/补料间隔固定档位优先覆盖单变量"
-        "没有测过的组合。温度只能是 20/25/30℃，补料间隔只能是 12/24h——这两个变量的档位在单变量阶段已经测全，"
-        "Round 2 不会再对它们做响应面细化。"
+        "基线重复、单变量法(OFAT)、联合探索(LHS) 三个模块可以独立开关和配置——某个数量填 0，"
+        "或不选任何变量，就相当于关掉那个模块，可以拼出纯 LHS、纯 OFAT 或任意组合。"
+        "表单打开时的默认值就是已经和研发组确认过的方案（基线×3 + OFAT×11 + 联合探索×4，共 18 个样本）。"
     )
 
-    if "round1_results_df" not in st.session_state:
-        if PICHIA_DEFAULT_DATASET_PATH.exists():
-            try:
-                st.session_state["round1_results_df"] = pd.read_csv(PICHIA_DEFAULT_DATASET_PATH)
-            except Exception as exc:
-                st.warning(f"读取 {PICHIA_DEFAULT_DATASET_PATH} 失败（{exc}），改用新生成的设计。")
-                st.session_state["round1_results_df"] = generate_round1_design()
-        else:
+    st.markdown("##### 基线取值")
+    baseline_config: dict[str, float] = {}
+    continuous_vars = list(PICHIA_CONTINUOUS_BOUNDS)
+    baseline_cols = st.columns(len(continuous_vars))
+    for index, variable in enumerate(continuous_vars):
+        lower, upper = PICHIA_CONTINUOUS_BOUNDS[variable]
+        with baseline_cols[index]:
+            baseline_config[variable] = float(
+                st.number_input(
+                    PICHIA_VARIABLE_LABELS.get(variable, variable),
+                    min_value=float(lower),
+                    max_value=float(upper),
+                    value=float(PICHIA_ROUND1_BASELINE[variable]),
+                    key=f"round1_builder_baseline_{variable}",
+                )
+            )
+    fixed_vars = list(PICHIA_FIXED_LEVELS)
+    fixed_cols = st.columns(len(fixed_vars))
+    for index, variable in enumerate(fixed_vars):
+        options = PICHIA_FIXED_LEVELS[variable]
+        default_value = PICHIA_ROUND1_BASELINE[variable]
+        with fixed_cols[index]:
+            baseline_config[variable] = float(
+                st.selectbox(
+                    PICHIA_VARIABLE_LABELS.get(variable, variable),
+                    options,
+                    index=options.index(default_value) if default_value in options else 0,
+                    key=f"round1_builder_baseline_{variable}",
+                )
+            )
+
+    st.markdown("##### 基线重复")
+    n_baseline = st.number_input(
+        "基线重复次数（0 = 不生成基线重复行）",
+        min_value=0,
+        max_value=10,
+        value=3,
+        key="round1_builder_n_baseline",
+    )
+
+    st.markdown("##### 单变量法 (OFAT)")
+    ofat_vars = st.multiselect(
+        "参与 OFAT 的变量（不选 = 不生成 OFAT 行）",
+        list(PICHIA_VARIABLES),
+        default=list(PICHIA_VARIABLES),
+        format_func=lambda v: PICHIA_VARIABLE_LABELS.get(v, v),
+        key="round1_builder_ofat_vars",
+    )
+    ofat_levels_config: dict[str, list[float]] = {}
+    ofat_errors: list[str] = []
+    for variable in ofat_vars:
+        default_levels = PICHIA_OFAT_LEVELS.get(variable, [])
+        selected = st.multiselect(
+            f"{PICHIA_VARIABLE_LABELS.get(variable, variable)} 的测试水平",
+            options=default_levels,
+            default=default_levels,
+            accept_new_options=True,
+            help="可以直接勾掉/加回推荐水平，也可以在框里输入自定义数值后回车添加。",
+            key=f"round1_builder_ofat_levels_{variable}",
+        )
+        try:
+            ofat_levels_config[variable] = sorted({float(value) for value in selected})
+        except (TypeError, ValueError):
+            ofat_errors.append(PICHIA_VARIABLE_LABELS.get(variable, variable))
+    if ofat_errors:
+        st.error(f"以下变量输入了无法识别成数字的自定义水平，请检查：{', '.join(ofat_errors)}")
+
+    st.markdown("##### 联合探索 (LHS)")
+    n_combo = st.number_input(
+        "联合探索点数（0 = 不生成联合探索行）",
+        min_value=0,
+        max_value=50,
+        value=4,
+        key="round1_builder_n_combo",
+    )
+    combo_vars = st.multiselect(
+        "参与联合探索的连续变量",
+        continuous_vars,
+        default=continuous_vars,
+        format_func=lambda v: PICHIA_VARIABLE_LABELS.get(v, v),
+        key="round1_builder_combo_vars",
+    )
+
+    counts = count_round1_rows(ofat_levels_config, int(n_baseline), int(n_combo), baseline=baseline_config)
+    st.caption(
+        f"预计生成：基线 {counts['baseline']} + OFAT {counts['ofat']} + 联合探索 {counts['combo']} "
+        f"= 共 {counts['total']} 行"
+    )
+
+    generate_col, reset_col = st.columns(2)
+    with generate_col:
+        if st.button(
+            "生成 Round 1 设计",
+            type="primary",
+            width="stretch",
+            disabled=bool(ofat_errors),
+            key="generate_round1_design_button",
+        ):
+            st.session_state["round1_results_df"] = generate_round1_design(
+                baseline=baseline_config,
+                ofat_levels=ofat_levels_config or None,
+                n_baseline_replicates=int(n_baseline),
+                n_combo_points=int(n_combo),
+                combo_variables=combo_vars or None,
+            )
+            st.session_state.pop("round2_bo_result", None)
+            st.success(f"已生成 {counts['total']} 行 Round 1 设计。")
+    with reset_col:
+        if st.button("直接使用已验证方案（18 样本，不改上面的表单）", width="stretch", key="round1_use_preset"):
             st.session_state["round1_results_df"] = generate_round1_design()
+            st.session_state.pop("round2_bo_result", None)
+            st.success("已生成已验证的 18 样本方案。")
+
+
+def _pichia_yield_scatter_chart(df: pd.DataFrame, value_col: str, title: str) -> go.Figure:
+    """Box+jitter chart of `value_col` grouped by run_type: shows both the
+    per-group distribution/spread and every individual point (run_id on hover),
+    covering the "distribution" and "error/noise" asks in one figure."""
+
+    numeric = df.copy()
+    numeric[value_col] = pd.to_numeric(numeric[value_col], errors="coerce")
+    plot_df = numeric.dropna(subset=[value_col])
+
+    fig = go.Figure()
+    for run_type in ["baseline", "ofat", "combo"]:
+        subset = plot_df[plot_df["run_type"] == run_type]
+        if subset.empty:
+            continue
+        fig.add_trace(
+            go.Box(
+                y=subset[value_col],
+                x=[PICHIA_RUN_TYPE_LABELS[run_type]] * len(subset),
+                boxpoints="all",
+                jitter=0.5,
+                pointpos=0,
+                marker_color=PICHIA_RUN_TYPE_COLORS[run_type],
+                line_color=PICHIA_RUN_TYPE_COLORS[run_type],
+                text=subset["run_id"],
+                hovertemplate="%{text}<br>" + value_col + "=%{y}<extra></extra>",
+            )
+        )
+    fig.update_layout(
+        title=title,
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+        yaxis_title=value_col,
+        margin=dict(t=40, b=30, l=50, r=20),
+        height=380,
+    )
+    return fig
+
+
+def _pichia_correlation_heatmap(df: pd.DataFrame) -> go.Figure:
+    columns = [*PICHIA_VARIABLES, PICHIA_TARGET_COL, PICHIA_OD_COL]
+    numeric = df[columns].apply(pd.to_numeric, errors="coerce")
+    corr = numeric.corr(method="spearman", min_periods=3)
+    labels = [PICHIA_VARIABLE_LABELS.get(column, column) for column in columns]
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=corr.to_numpy(),
+            x=labels,
+            y=labels,
+            colorscale=PICHIA_DIVERGING_COLORSCALE,
+            zmid=0,
+            zmin=-1,
+            zmax=1,
+            hovertemplate="%{y} vs %{x}: %{z:.2f}<extra></extra>",
+            colorbar=dict(title="Spearman r"),
+        )
+    )
+    fig.update_layout(
+        title="变量与产量/OD600 相关性（Spearman，仅 18 个样本，供参考，非结论性）",
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(t=40, b=40, l=110, r=20),
+        height=450,
+    )
+    return fig
+
+
+def _pichia_baseline_lookup(df: pd.DataFrame) -> dict[str, Any]:
+    """Most-common value per variable column. Stands in for "the baseline"
+    even when baseline-replicate rows are disabled (n_baseline_replicates=0),
+    since every row that doesn't deliberately vary a given variable leaves it
+    at that value -- so the mode across the whole design is still correct."""
+    lookup: dict[str, Any] = {}
+    for variable in PICHIA_VARIABLES:
+        if variable in df.columns:
+            mode = df[variable].mode()
+            if not mode.empty:
+                lookup[variable] = mode.iloc[0]
+    return lookup
+
+
+def _pichia_format_value(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    if isinstance(value, float) and value == int(value):
+        return str(int(value))
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def _pichia_type_label(run_type: str, changed_variable: str | None) -> str:
+    """"类型" column text. OFAT rows name the specific variable being swept
+    ("单变量-种子初始OD600") rather than a generic "单变量(OFAT)" label shared
+    by all 11 OFAT rows -- otherwise the type column alone can't tell them
+    apart at a glance. Baseline/combo stay generic since every row of that
+    type really is the same thing."""
+    if run_type == "ofat":
+        label = PICHIA_VARIABLE_LABELS.get(changed_variable, changed_variable or "")
+        return f"单变量-{label}"
+    return PICHIA_RUN_TYPE_LABELS.get(run_type, run_type)
+
+
+def _pichia_row_note(
+    run_type: str,
+    changed_variable: str | None,
+    row: pd.Series | None = None,
+    baseline_lookup: dict[str, Any] | None = None,
+) -> str:
+    if run_type == "baseline":
+        return "当前摇瓶标准条件重复，用于估计批次噪声（纯误差）"
+    if run_type == "ofat":
+        label = PICHIA_VARIABLE_LABELS.get(changed_variable, changed_variable or "")
+        if row is not None and baseline_lookup and changed_variable in baseline_lookup:
+            old = _pichia_format_value(baseline_lookup[changed_variable])
+            new = _pichia_format_value(row.get(changed_variable))
+            return f"单变量法：「{label}」由基线 {old} 改为 {new}，其余变量维持基线不变"
+        return f"单变量法：只改变「{label}」，其余变量维持基线不变"
+    if run_type == "combo":
+        return "联合探索：连续变量按拉丁超立方(LHS)联合取值，温度/补料间隔取固定档位组合"
+    return ""
+
+
+def _pichia_design_display_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Chinese-labeled, note-annotated preview of the design -- used for the
+    plain in-app st.dataframe. No row coloring here: st.dataframe's Styler
+    support renders inconsistently for this table in practice, so the actual
+    "pretty, colored" output is the Excel workbook below instead of trying to
+    force parity inside Streamlit's canvas-rendered grid."""
+    run_type = df["run_type"] if "run_type" in df.columns else pd.Series("", index=df.index)
+    changed_variable = df["changed_variable"] if "changed_variable" in df.columns else pd.Series(None, index=df.index)
+    baseline_lookup = _pichia_baseline_lookup(df)
+
+    display = pd.DataFrame(index=df.index)
+    display["编号"] = df["run_id"]
+    display["类型"] = [
+        _pichia_type_label(run_type.loc[idx], changed_variable.loc[idx]) for idx in df.index
+    ]
+    for variable in PICHIA_VARIABLES:
+        if variable in df.columns:
+            display[PICHIA_VARIABLE_LABELS.get(variable, variable)] = df[variable]
+    display["收获时OD600"] = df.get(PICHIA_OD_COL)
+    display["hLF产量"] = df.get(PICHIA_TARGET_COL)
+    display["备注/目的"] = [
+        _pichia_row_note(run_type.loc[idx], changed_variable.loc[idx], df.loc[idx], baseline_lookup)
+        for idx in df.index
+    ]
+    return display
+
+
+def _pichia_round1_workbook_bytes(df: pd.DataFrame) -> bytes:
+    """Polished .xlsx twin of the design: colored rows by run_type, Chinese
+    headers, an auto-generated notes column, a legend, and a frozen header --
+    the same look already approved from an earlier one-off script, now built
+    dynamically from whatever design was actually generated (any mix of
+    baseline/OFAT/LHS) instead of a fixed example."""
+    run_type = df["run_type"] if "run_type" in df.columns else pd.Series("", index=df.index)
+    changed_variable = df["changed_variable"] if "changed_variable" in df.columns else pd.Series(None, index=df.index)
+    baseline_lookup = _pichia_baseline_lookup(df)
+
+    font_name = "Calibri"
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(name=font_name, size=11, bold=True, color="FFFFFF")
+    baseline_fill = PatternFill("solid", fgColor="E2EFDA")
+    combo_fill = PatternFill("solid", fgColor="DDEBF7")
+    fillin_fill = PatternFill("solid", fgColor="FFF2CC")
+    thin = Side(style="thin", color="B7B7B7")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    center = Alignment(horizontal="center", vertical="center")
+    wrap_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    wrap_left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    # only "type" and "note" hold variable-length sentences -- everything else
+    # is a short id/number, so it stays single-line and the table stays compact
+    wrap_keys = {"run_type", "note"}
+
+    columns: list[tuple[str, str, float]] = [("run_id", "编号", 9), ("run_type", "类型", 18)]
+    for variable in PICHIA_VARIABLES:
+        if variable in df.columns:
+            columns.append((variable, PICHIA_VARIABLE_LABELS.get(variable, variable), 13))
+    columns.append((PICHIA_OD_COL, "收获时OD600(待填)", 12))
+    columns.append((PICHIA_TARGET_COL, "hLF产量(待填)", 12))
+    columns.append(("note", "备注/目的", 34))
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Round1设计"
+    ws.sheet_view.showGridLines = False
+
+    for col_idx, (_key, label, width) in enumerate(columns, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=label)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+        cell.border = border
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+    # deliberately no explicit row_dimensions[1].height: leaving customHeight
+    # unset lets Excel auto-fit each row to its own wrapped content on open,
+    # which is what actually works when note length varies this much between
+    # row types -- any single fixed height is either too tall for short
+    # baseline notes or clipped for the longer combo/ofat notes.
+    ws.freeze_panes = "A2"
+
+    row_fill_by_type = {"baseline": baseline_fill, "combo": combo_fill}
+
+    for offset, idx in enumerate(df.index):
+        row_idx = offset + 2
+        rt = run_type.loc[idx]
+        row = df.loc[idx]
+        note = _pichia_row_note(rt, changed_variable.loc[idx], row, baseline_lookup)
+        values: dict[str, Any] = {
+            "run_id": row.get("run_id"),
+            "run_type": _pichia_type_label(rt, changed_variable.loc[idx]),
+            PICHIA_OD_COL: row.get(PICHIA_OD_COL),
+            PICHIA_TARGET_COL: row.get(PICHIA_TARGET_COL),
+            "note": note,
+        }
+        for variable in PICHIA_VARIABLES:
+            if variable in df.columns:
+                values[variable] = row.get(variable)
+
+        row_fill = row_fill_by_type.get(rt)
+        for col_idx, (key, _label, _width) in enumerate(columns, start=1):
+            value = values.get(key)
+            if isinstance(value, float) and pd.isna(value):
+                value = None
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.font = Font(name=font_name, size=10)
+            cell.border = border
+            if key == "note":
+                cell.alignment = wrap_left
+            elif key in wrap_keys:
+                cell.alignment = wrap_center
+            else:
+                cell.alignment = center
+            if key in (PICHIA_OD_COL, PICHIA_TARGET_COL):
+                cell.fill = fillin_fill
+            elif row_fill is not None:
+                cell.fill = row_fill
+
+    legend_row = len(df) + 3
+    legend_title = ws.cell(row=legend_row, column=1, value="图例：")
+    legend_title.font = Font(name=font_name, size=10, bold=True)
+    legend_items = [
+        (baseline_fill, "基线重复（估计批次噪声）"),
+        (combo_fill, "联合探索点（LHS，多变量同时变化）"),
+        (fillin_fill, "需要填写的结果列"),
+    ]
+    for offset, (fill, text) in enumerate(legend_items):
+        marker_row = legend_row + 1 + offset
+        marker = ws.cell(row=marker_row, column=1, value=" ")
+        marker.fill = fill
+        marker.border = border
+        label_cell = ws.cell(row=marker_row, column=2, value=text)
+        label_cell.font = Font(name=font_name, size=10)
+        ws.merge_cells(start_row=marker_row, start_column=2, end_row=marker_row, end_column=len(columns))
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def _pichia_round1_tab() -> None:
+    _ensure_pichia_data_area()
+    st.markdown("### Round 1：实验设计构建器")
+    st.caption(
+        "温度只能是 20/25/30℃，补料间隔只能是 12/24h——这两个变量的档位一旦被单变量法测全，"
+        "就已经穷尽了离散选项，Round 2 不会再对它们做响应面细化。"
+    )
+
+    with st.expander("方案配置", expanded="round1_results_df" not in st.session_state):
+        _pichia_round1_builder()
+
+    if "round1_results_df" not in st.session_state:
+        st.info("配置好方案后点击「生成 Round 1 设计」，或直接用「直接使用已验证方案」一键生成。")
+        return
 
     st.markdown("#### 上传已回填结果（可选）")
     uploaded = st.file_uploader("上传已回填 yield_g_per_l / od600 的 CSV", type=["csv"], key="round1_results_upload")
@@ -1224,14 +1632,38 @@ def _pichia_round1_tab() -> None:
                 st.success("已加载并归档上传的 Round 1 结果。")
 
     working_df = st.session_state["round1_results_df"]
-    locked_columns = [column for column in working_df.columns if column not in (PICHIA_TARGET_COL, PICHIA_OD_COL)]
-    edited = st.data_editor(
-        working_df,
+
+    st.markdown("#### 设计总览")
+    excel_bytes = _pichia_round1_workbook_bytes(working_df)
+    st.download_button(
+        "下载设计表格（Excel，配色+备注，和示例一致）",
+        data=excel_bytes,
+        file_name="pichia_round1_design.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_round1_excel",
+    )
+    st.caption("配色、图例和备注列在 Excel 里最完整；下面是网页内的快速预览（不带颜色）。")
+    st.dataframe(_pichia_design_display_frame(working_df), width="stretch", hide_index=True)
+
+    st.markdown("#### 回填实测结果")
+    st.caption("按编号对应到上面总览表里的样本，这里只需要填产量和 OD600 这两列。")
+    entry_view = working_df[["run_id", PICHIA_TARGET_COL, PICHIA_OD_COL]].reset_index(drop=True)
+    edited_entries = st.data_editor(
+        entry_view,
         width="stretch",
         num_rows="fixed",
+        hide_index=True,
         key="round1_data_editor",
-        disabled=locked_columns,
+        disabled=["run_id"],
+        column_config={
+            "run_id": "编号",
+            PICHIA_TARGET_COL: "hLF产量",
+            PICHIA_OD_COL: "收获时OD600",
+        },
     )
+    edited = working_df.copy()
+    edited[PICHIA_TARGET_COL] = edited_entries[PICHIA_TARGET_COL].to_numpy()
+    edited[PICHIA_OD_COL] = edited_entries[PICHIA_OD_COL].to_numpy()
     st.session_state["round1_results_df"] = edited
 
     numeric = _pichia_numeric_results(edited)
@@ -1254,6 +1686,67 @@ def _pichia_round1_tab() -> None:
             edited.to_csv(PICHIA_DEFAULT_DATASET_PATH, index=False, encoding="utf-8-sig")
             st.success(f"已保存到 {PICHIA_DEFAULT_DATASET_PATH}")
 
+    if int(numeric[PICHIA_TARGET_COL].notna().sum()) >= 3:
+        st.markdown("#### 结果可视化")
+        chart_cols = st.columns(2)
+        with chart_cols[0]:
+            st.plotly_chart(
+                _pichia_yield_scatter_chart(numeric, PICHIA_TARGET_COL, "产量分布（按样本类型）"),
+                width="stretch",
+            )
+        with chart_cols[1]:
+            st.plotly_chart(
+                _pichia_yield_scatter_chart(numeric, PICHIA_OD_COL, "OD600 分布（按样本类型）"),
+                width="stretch",
+            )
+        st.plotly_chart(_pichia_correlation_heatmap(numeric), width="stretch")
+    else:
+        st.caption("至少回填 3 行产量数据后，这里会显示分布图和相关性热力图。")
+
+
+def _pichia_effect_magnitude_chart(effects: dict[str, FactorEffect], threshold: float) -> go.Figure:
+    """Horizontal bar of each variable's effect_magnitude, descending, with a
+    confidence-interval error bar and a reference line at the significance
+    threshold -- this is what actually decides K (how many variables become
+    "active" in resolve_round2_variables). Emphasis coloring (accent vs muted)
+    rather than a full categorical palette, since the only distinction that
+    matters here is "crossed the line" vs "didn't"."""
+
+    ordered = sorted(effects.values(), key=lambda effect: effect.effect_magnitude, reverse=True)
+    labels = [PICHIA_VARIABLE_LABELS.get(effect.variable, effect.variable) for effect in ordered]
+    magnitudes = [effect.effect_magnitude for effect in ordered]
+    colors = [PICHIA_ACCENT_COLOR if effect.significant else PICHIA_MUTED_COLOR for effect in ordered]
+    error_plus = [max(effect.ci_high - effect.effect_magnitude, 0.0) for effect in ordered]
+    error_minus = [max(effect.effect_magnitude - effect.ci_low, 0.0) for effect in ordered]
+
+    fig = go.Figure(
+        go.Bar(
+            x=magnitudes,
+            y=labels,
+            orientation="h",
+            marker_color=colors,
+            error_x=dict(type="data", symmetric=False, array=error_plus, arrayminus=error_minus, color="#c3c2b7"),
+            hovertemplate="%{y}: %{x:.3g}<extra></extra>",
+        )
+    )
+    fig.add_vline(
+        x=threshold,
+        line_dash="dash",
+        line_color="#c3c2b7",
+        annotation_text=f"显著性阈值 {threshold:.3g}",
+        annotation_position="top",
+    )
+    fig.update_layout(
+        title="各变量效应量（误差棒=置信区间，仅 3 次基线重复，df=2，区间偏宽属实情）",
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis_title="效应量 |偏离基线|",
+        margin=dict(t=50, b=40, l=140, r=30),
+        height=340,
+    )
+    return fig
+
 
 def _pichia_round2_tab() -> None:
     st.markdown("### Round 2：显著性分析 → 响应面（CCD）+ 约束贝叶斯优化")
@@ -1269,8 +1762,46 @@ def _pichia_round2_tab() -> None:
     if filled < len(run_df):
         st.warning("还有行没有回填完整结果；下面的分析只会用到已经有产量和 OD600 的行，结论可能随着数据补全而变化。")
 
+    with st.expander("分析参数", expanded=False):
+        param_cols = st.columns(3)
+        with param_cols[0]:
+            max_active_variables = st.number_input(
+                "最多活跃变量数 (K 上限)",
+                min_value=1,
+                max_value=6,
+                value=3,
+                help="超过这个数量的显著变量会按效应量排序，排不进的先固定在 round 1 最优水平。",
+                key="round2_max_active_variables",
+            )
+        with param_cols[1]:
+            ccd_step_fraction = st.slider(
+                "CCD 步长比例",
+                min_value=0.1,
+                max_value=1.0,
+                value=0.5,
+                step=0.05,
+                help="响应面设计的轴向步长 = 该比例 x 单变量法(OFAT)的水平间距。",
+                key="round2_ccd_step_fraction",
+            )
+        with param_cols[2]:
+            od_threshold_fraction = st.slider(
+                "OD600 约束比例",
+                min_value=0.1,
+                max_value=1.0,
+                value=0.7,
+                step=0.05,
+                help="OD600 约束阈值 = 该比例 x 基线 OD600 均值，工程默认值，非生物学判断。",
+                key="round2_od_threshold_fraction",
+            )
+
     try:
-        plan = plan_round2(run_df, PICHIA_ROUND1_BASELINE)
+        plan = plan_round2(
+            run_df,
+            PICHIA_ROUND1_BASELINE,
+            od_threshold_fraction=float(od_threshold_fraction),
+            ccd_step_fraction=float(ccd_step_fraction),
+            max_active_variables=int(max_active_variables),
+        )
     except ValueError as exc:
         st.error(f"Round 2 分析暂时无法运行：{exc}")
         return
@@ -1290,10 +1821,13 @@ def _pichia_round2_tab() -> None:
     st.dataframe(pd.DataFrame(fixed_rows), width="stretch", hide_index=True)
 
     st.markdown("#### 活跃变量（进入响应面设计）")
+    st.metric("活跃变量数 (K)", len(plan.active_variables))
+    st.plotly_chart(
+        _pichia_effect_magnitude_chart(plan.effects, noise["threshold"]),
+        width="stretch",
+    )
     if not plan.active_variables:
         st.info("当前数据下没有变量的效应大到需要响应面细化；可以直接看下面的贝叶斯优化建议，或考虑扩大探索范围重新走一轮。")
-    else:
-        st.write("、".join(PICHIA_VARIABLE_LABELS.get(name, name) for name in plan.active_variables))
     for variable, note in plan.boundary_notes.items():
         st.warning(f"{PICHIA_VARIABLE_LABELS.get(variable, variable)}：{note}")
     for variable, note in plan.overflow_notes.items():

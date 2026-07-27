@@ -6,6 +6,7 @@ import pytest
 from experiment_advisor.recommendation.round2_design import (
     FactorEffect,
     analyze_round1_effects,
+    effect_confidence_interval,
     estimate_baseline_noise,
     find_reusable_round1_row,
     generate_ccd,
@@ -99,6 +100,12 @@ def test_analyze_round1_effects_classifies_variables_correctly():
     for variable in ["seed_od", "glucose_pct", "interval_h", "volume_ml"]:
         assert effects[variable].significant is False, variable
 
+    # every variable gets a confidence interval around its effect_magnitude,
+    # widened by the pooled baseline variance (3 replicates -> df=2)
+    for variable, effect in effects.items():
+        assert effect.ci_low <= effect.effect_magnitude <= effect.ci_high, variable
+        assert effect.ci_low >= 0.0, variable
+
     # combo interactions: 4 rows changed 2+ variables; only R1-16 should be flagged
     combos = {item["row_id"]: item for item in result["combo_interactions"]}
     assert set(combos) == {"R1-15", "R1-16", "R1-17", "R1-18"}
@@ -106,6 +113,25 @@ def test_analyze_round1_effects_classifies_variables_correctly():
     assert combos["R1-15"]["possible_interaction"] is False
     assert combos["R1-17"]["possible_interaction"] is False
     assert combos["R1-18"]["possible_interaction"] is False
+
+
+def test_effect_confidence_interval_matches_hand_derived_t_margin():
+    # t.ppf(0.975, df=2) ~= 4.303 (standard table value)
+    low, high = effect_confidence_interval(effect=0.19, baseline_sd=0.035, n_baseline_replicates=3)
+    expected_margin = 0.035 * 4.303 * (4.0 / 3.0) ** 0.5
+    assert high - 0.19 == pytest.approx(expected_margin, rel=1e-3)
+    assert 0.19 - low == pytest.approx(expected_margin, rel=1e-3)
+
+
+def test_effect_confidence_interval_widens_with_fewer_replicates():
+    _, high_3 = effect_confidence_interval(effect=0.1, baseline_sd=0.02, n_baseline_replicates=3)
+    _, high_5 = effect_confidence_interval(effect=0.1, baseline_sd=0.02, n_baseline_replicates=5)
+    assert (high_3 - 0.1) > (high_5 - 0.1)
+
+
+def test_effect_confidence_interval_undefined_below_two_replicates():
+    low, high = effect_confidence_interval(effect=0.1, baseline_sd=0.02, n_baseline_replicates=1)
+    assert pd.isna(low) and pd.isna(high)
 
 
 def test_resolve_round2_variables_keeps_interior_peak_active():
@@ -225,6 +251,13 @@ def test_plan_round2_end_to_end():
 
     assert plan.od_threshold["threshold"] == pytest.approx(45.0 * 0.7)
     assert any(item["possible_interaction"] for item in plan.combo_interactions)
+
+    # plan.effects exposes the same FactorEffect objects analyze_round1_effects
+    # computes internally, so callers (e.g. the effect-magnitude chart) don't
+    # have to re-run the analysis themselves.
+    assert set(plan.effects) == set(BASELINE)
+    assert plan.effects["ph"].significant is True
+    assert plan.effects["ph"].ci_low <= plan.effects["ph"].effect_magnitude <= plan.effects["ph"].ci_high
 
 
 def test_recommend_round2_bo_batch():
