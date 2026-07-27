@@ -96,6 +96,39 @@ class FactorEffect:
     effect_magnitude: float  # max |deviation from baseline| across non-baseline levels
     at_lower_bound: bool = False
     at_upper_bound: bool = False
+    ci_low: float = 0.0  # confidence interval on effect_magnitude, see effect_confidence_interval()
+    ci_high: float = 0.0
+
+
+def effect_confidence_interval(
+    effect: float,
+    baseline_sd: float,
+    n_baseline_replicates: int,
+    confidence: float = 0.95,
+) -> tuple[float, float]:
+    """Confidence interval for a single-replicate effect vs. a replicated baseline mean.
+
+    Round 1 mostly has one observation per non-baseline level, so a per-level
+    variance can't be estimated on its own. Standard DOE practice is to assume
+    the baseline replicates' variance (pure error) applies uniformly across the
+    design space -- that's the whole point of repeating the center/baseline
+    point rather than every treatment. Under that assumption, a single new
+    observation minus the baseline mean has variance baseline_sd^2 * (1 + 1/n),
+    and the interval uses a t critical value at n_baseline_replicates - 1
+    degrees of freedom. With only 3 replicates (df=2) the interval is wide --
+    that width is honest information about how little replication round 1 has,
+    not a defect to hide.
+    """
+
+    df = n_baseline_replicates - 1
+    if df < 1:
+        return (float("nan"), float("nan"))
+    from scipy import stats
+
+    se = baseline_sd * (1.0 + 1.0 / n_baseline_replicates) ** 0.5
+    t_crit = float(stats.t.ppf(0.5 + confidence / 2.0, df))
+    margin = t_crit * se
+    return (effect - margin, effect + margin)
 
 
 def _levels_for(variable: str, df: pd.DataFrame, baseline: dict[str, float], other_vars: list[str], tol: float) -> pd.DataFrame:
@@ -154,6 +187,11 @@ def analyze_round1_effects(
             at_lower = _is_close(best_value, lower, tol=1e-3)
             at_upper = _is_close(best_value, upper, tol=1e-3)
 
+        ci_low, ci_high = effect_confidence_interval(
+            effect_magnitude, noise["baseline_sd"], noise["n_replicates"]
+        )
+        ci_low = max(ci_low, 0.0) if pd.notna(ci_low) else 0.0
+
         effects[variable] = FactorEffect(
             variable=variable,
             kind=kind,
@@ -165,6 +203,8 @@ def analyze_round1_effects(
             effect_magnitude=effect_magnitude,
             at_lower_bound=at_lower,
             at_upper_bound=at_upper,
+            ci_low=ci_low,
+            ci_high=ci_high if pd.notna(ci_high) else effect_magnitude,
         )
 
     return {
@@ -419,6 +459,7 @@ class Round2Plan:
     combo_interactions: list[dict[str, Any]]
     od_threshold: dict[str, Any]
     noise: dict[str, Any]
+    effects: dict[str, FactorEffect]
 
 
 def plan_round2(
@@ -458,6 +499,7 @@ def plan_round2(
         combo_interactions=analysis["combo_interactions"],
         od_threshold=od600_threshold(round1_df, baseline, od_col=od_col, fraction=od_threshold_fraction),
         noise=analysis["noise"],
+        effects=effects,
     )
 
 

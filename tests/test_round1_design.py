@@ -5,10 +5,11 @@ import pytest
 from experiment_advisor.recommendation.round1_design import (
     BASELINE,
     OFAT_LEVELS,
+    count_round1_rows,
     generate_round1_design,
     round1_template_columns,
 )
-from experiment_advisor.recommendation.round2_design import FIXED_LEVELS
+from experiment_advisor.recommendation.round2_design import CONTINUOUS_BOUNDS, FIXED_LEVELS
 
 
 def test_generate_round1_design_default_shape():
@@ -89,3 +90,91 @@ def test_generate_round1_design_respects_custom_run_id_prefix():
     assert df["run_id"].iloc[0] == "Y103-R1-01"
     assert df["run_id"].iloc[-1] == "Y103-R1-18"
     assert df["run_id"].is_unique
+
+
+def test_zero_baseline_replicates_are_skipped():
+    df = generate_round1_design(n_baseline_replicates=0)
+    assert (df["run_type"] == "baseline").sum() == 0
+    assert len(df) == 11 + 4  # ofat + combo unaffected
+
+
+def test_ofat_disabled_entirely_skips_ofat_rows():
+    df = generate_round1_design(ofat_levels=None)
+    assert (df["run_type"] == "ofat").sum() == 0
+    assert len(df) == 3 + 4  # baseline + combo unaffected
+
+
+def test_ofat_partial_variable_coverage():
+    # Only pH gets OFAT rows; every other variable stays untouched.
+    df = generate_round1_design(ofat_levels={"ph": [5.0, 7.0]})
+    ofat_rows = df[df["run_type"] == "ofat"]
+    assert len(ofat_rows) == 2
+    assert set(ofat_rows["changed_variable"]) == {"ph"}
+    assert set(ofat_rows["ph"]) == {5.0, 7.0}
+
+
+def test_zero_combo_points_skips_combo_rows():
+    df = generate_round1_design(n_combo_points=0)
+    assert (df["run_type"] == "combo").sum() == 0
+    assert len(df) == 3 + 11
+
+
+def test_combo_variables_subset_holds_others_at_baseline():
+    df = generate_round1_design(combo_variables=["ph", "volume_ml"])
+    combo_rows = df[df["run_type"] == "combo"]
+    assert len(combo_rows) == 4
+    # seed_od and glucose_pct were excluded from the LHS sweep -> stay at baseline
+    assert (combo_rows["seed_od"] == BASELINE["seed_od"]).all()
+    assert (combo_rows["glucose_pct"] == BASELINE["glucose_pct"]).all()
+    # ph and volume_ml were included -> at least some rows should differ from baseline
+    assert not (combo_rows["ph"] == BASELINE["ph"]).all()
+    assert not (combo_rows["volume_ml"] == BASELINE["volume_ml"]).all()
+
+
+def test_pure_lhs_design_disables_baseline_and_ofat():
+    df = generate_round1_design(n_baseline_replicates=0, ofat_levels=None, n_combo_points=18)
+    assert len(df) == 18
+    assert (df["run_type"] == "combo").all()
+    for variable, (lower, upper) in CONTINUOUS_BOUNDS.items():
+        assert df[variable].between(lower, upper).all()
+    assert set(df["temp_c"]) <= set(FIXED_LEVELS["temp_c"])
+    assert set(df["interval_h"]) <= set(FIXED_LEVELS["interval_h"])
+
+
+def test_pure_ofat_design_disables_combo():
+    df = generate_round1_design(n_combo_points=0)
+    assert len(df) == 3 + 11
+    assert (df["run_type"] != "combo").all()
+
+
+def test_combo_pairs_treat_disabled_ofat_variable_as_fully_untested():
+    # If temp_c OFAT is turned off, every temp x interval pair is "untested" by
+    # OFAT (there are no temp_c OFAT rows at all), so combo rows should be free
+    # to explore the full grid, not just the two pairs OFAT-with-temp normally
+    # misses.
+    partial_levels = {k: v for k, v in OFAT_LEVELS.items() if k != "temp_c"}
+    df = generate_round1_design(ofat_levels=partial_levels, n_combo_points=6)
+    combo_rows = df[df["run_type"] == "combo"]
+    pairs_seen = set(zip(combo_rows["temp_c"], combo_rows["interval_h"]))
+    all_pairs = {(t, i) for t in FIXED_LEVELS["temp_c"] for i in FIXED_LEVELS["interval_h"]}
+    # with temp_c OFAT off, only the interval_h-baseline-paired combos count as
+    # "covered" -- everything else, including baseline-temp pairs, should be
+    # prioritised, so with 6 combo points we should see more than the 2-pair
+    # minimum guaranteed when temp_c OFAT is active.
+    assert len(pairs_seen) >= 4
+    assert pairs_seen <= all_pairs
+
+
+def test_count_round1_rows_matches_actual_generation():
+    configs = [
+        (OFAT_LEVELS, 3, 4),
+        (None, 0, 18),
+        ({"ph": [5.0, 7.0]}, 3, 0),
+        (OFAT_LEVELS, 0, 0),
+    ]
+    for ofat_levels, n_baseline, n_combo in configs:
+        counts = count_round1_rows(ofat_levels, n_baseline, n_combo)
+        actual = generate_round1_design(
+            ofat_levels=ofat_levels, n_baseline_replicates=n_baseline, n_combo_points=n_combo
+        )
+        assert counts["total"] == len(actual), (ofat_levels, n_baseline, n_combo)
