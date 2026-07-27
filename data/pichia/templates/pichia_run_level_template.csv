@@ -1,1 +1,1 @@
-run_id,experiment_date,strain_id,parent_strain_id,growth_phase_ph,production_phase_ph,growth_phase_temp_c,production_phase_temp_c,glucose_start_time_h,glucose_concentration_g_l,fan_speed_rpm,yield_g_per_l,notes
+run_id,run_type,changed_variable,seed_od,glucose_pct,ph,volume_ml,temp_c,interval_h,yield_g_per_l,od600,experiment_date,strain_id,notes
