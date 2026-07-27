@@ -2,11 +2,13 @@
 
 此目录用于课程展示材料。
 
+当前项目：毕赤酵母摇瓶发酵生产 hLF，从零开始（无历史数据）。之前 HMO 发酵罐阶段的内容已作废，不再适用。
+
 课程 PDF 要求提交 5-10 页 PPT PDF，或 10-12 分钟 demo video。建议结构：
 
-1. Problem：发酵实验周期长、成本高、小样本，目标是提高 `yield_g_per_l`
-2. Data：Excel/CSV 到 run-level dataset 的整理流程
-3. Method：标准 GP-BO（qNEI）作为主推荐，使用 BoTorch 联合优化 batch
-4. Results：推荐结果、预测产量、不确定性、相似历史实验
-5. Explainability：指标说明、GP 切片图、偏依赖图、风险解释
-6. Limitations and Future Work：样本量限制、人工审议、下一轮实验回填
+1. Problem：零历史数据起步，摇瓶每轮 15~20 个样本、2~5 轮的约束下如何优化 hLF `yield_g_per_l`
+2. Data：摇瓶 run-level 数据模板与回填流程；当前尚无真实实验数据，首轮结果将是第一批训练信号
+3. Method：基准点选择（同菌种历史最优/最近成功、亲本菌种借鉴、手动输入）+ 小样本探索（联合 LHS 扰动、序贯 2 因子 DOE、单变量验证）；样本量积累后再评估是否引入 GP-BO
+4. Results：首轮/后续轮次建议、变量探索范围覆盖情况、DOE 主效应与交互效应解读（若使用序贯 DOE）
+5. Explainability：边界风险标注、菌种支持类型（同菌种/亲本借鉴/跨菌种）、DOE 反馈建议（缩小范围/平移窗口/换变量）
+6. Limitations and Future Work：零数据起步的不确定性、跨菌种借鉴风险、摇瓶与发酵罐工艺差异、轮次弹性调整规则（稳定减 1 轮/不稳定加 1~2 轮）、推荐模块批量口径待适配摇瓶规模

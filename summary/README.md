@@ -2,13 +2,15 @@
 
 此目录用于课程要求的一页总结和辅助报告。
 
+当前项目：毕赤酵母（Pichia pastoris）摇瓶发酵生产 hLF（人乳铁蛋白），从零开始（无可用历史数据）。之前 HMO 发酵罐阶段的产出已归档到 `archive_hmo/`，数据已确认无效，仅供方法论参考。
+
 建议一页总结覆盖：
 
-- Problem：HMO 发酵产量优化问题和高成本小样本约束
-- Data：历史 run-level 数据来源、可训练 run 数、排除规则
-- Method：`standard_bo_qnei` 主推荐，BoTorch qNEI + MLE GP
-- Results：推荐参数、预测产量、不确定性和相似历史实验
-- Limitations：样本量、外推风险、湿实验不确定性
-- Next Steps：下一批实验执行后如何回填数据并重新推荐
+- Problem：hLF 摇瓶产量优化问题，零历史数据、每轮样本数有限的约束
+- Data：摇瓶实验设计——每轮 15~20 个样本，默认 3 轮，结果稳定可减至 2 轮，不稳定可追加 1~2 轮；当前 `data/pichia/` 下尚无真实实验数据
+- Method：`experiment_advisor/recommendation/pichia.py` 提供基于基准点的小样本推荐（同菌种/亲本菌种借鉴、序贯 DOE、单变量验证）；该模块目前仍按发酵罐口径实现（单轮上限 4 个建议），摇瓶批量（15~20/轮）的适配是下一阶段代码工作，见根目录 `README.md` 的已知差距说明
+- Results：待首轮摇瓶实验数据回填后再产出
+- Limitations：零历史数据下基准点选择的不确定性、跨菌种借鉴风险、摇瓶与发酵罐工艺差异可能影响参数可迁移性
+- Next Steps：首轮 15~20 个样本执行完成后回填产量结果，据此判断是否需要调整变量范围、是否提前收敛或追加轮次
 
-`supporting_reports/` 可保存数据质量、模型诊断、推荐报告等辅助材料。
+`archive_hmo/` 保存 HMO 阶段的数据质量、EDA、字段字典、推荐报告等历史材料（已停用，见该目录下 `README.md`）。后续 Pichia 摇瓶阶段的辅助报告可在此目录下新建 `supporting_reports/` 存放。

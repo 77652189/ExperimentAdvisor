@@ -6,17 +6,13 @@ from experiment_advisor.ingestion.loader import load_fermentation_data
 from experiment_advisor.ingestion.pipeline import build_final_dataset, build_run_level_dataset
 from experiment_advisor.ingestion.run_level import MODEL_FEATURES
 from experiment_advisor.ingestion.validator import validate
-from experiment_advisor.optimizer.bo_engine import BOEngine
 from experiment_advisor.recommendation.service import compare_recommenders, recommend_next
 from experiment_advisor.report.reporter import generate_recommendation_report
-from experiment_advisor.space.parameter_space import build_search_space
 
 __all__ = [
-    "BOEngine",
     "MODEL_FEATURES",
     "build_final_dataset",
     "build_run_level_dataset",
-    "build_search_space",
     "compare_recommenders",
     "engineer_features",
     "estimate_noise",
