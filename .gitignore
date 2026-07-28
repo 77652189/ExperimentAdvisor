@@ -41,7 +41,7 @@ reference_repo/
 
 # Generated reports/artifacts that may summarize sensitive data
 outputs/
-summary/recommendation_report.md
-summary/supporting_reports/
-summary/archive_hmo/recommendation_report.md
-summary/archive_hmo/supporting_reports/
+archive/summary/recommendation_report.md
+archive/summary/supporting_reports/
+archive/summary/archive_hmo/recommendation_report.md
+archive/summary/archive_hmo/supporting_reports/

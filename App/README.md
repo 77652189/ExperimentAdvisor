@@ -1,6 +1,6 @@
 # App
 
-此目录是 Streamlit 交付入口，提供中文可解释界面，含两个页签：**Pichia 摇瓶**（当前活跃）和 **HMO/2FL**（历史，数据已作废）。
+此目录是 Streamlit 交付入口，提供中文可解释界面。侧栏切换两种模式：**毕赤酵母 hLF**（当前活跃，默认）和**大肠杆菌 BO**（历史，数据已作废）。
 
 运行方式：
 
@@ -8,19 +8,32 @@
 streamlit run App/app.py
 ```
 
-## Pichia 摇瓶页签（当前）
+## 毕赤酵母 hLF 模式（当前，默认）
 
-- 数据入口：`data/pichia/final/pichia_run_level_dataset.csv`，或上传/手动录入 run-level 数据
-- 可下载空模板：`data/pichia/templates/pichia_run_level_template.csv`
-- 选择基准点来源（同菌种历史最优/最近成功、亲本菌种借鉴、手动输入）和探索方式（联合探索 LHS、序贯 2 因子 DOE、单变量验证），生成下一批建议
-- 序贯 DOE 模式支持回填实测产量后自动计算主效应/交互效应，给出下一轮基准点和范围建议
-- 参数体系目前仍是发酵罐口径（见根目录 `README.md` 的已知差距说明），摇瓶批量适配待后续版本
+三个页签，对应 `experiment_advisor/recommendation/round1_design.py` 和 `round2_design.py`：
 
-## HMO/2FL 页签（历史，仅供参考）
+### Round 1：实验设计
+
+- **方案构建器**：基线取值（4 个连续变量数字输入 + 温度/补料间隔下拉选固定档位）、基线重复次数、OFAT 参与变量与测试水平、LHS 联合探索点数与参与变量，三个模块可独立开关、任意组合。顶部有实时预计行数提示，也可一键套用已和研发组确认过的方案（18 样本）。
+- **OFAT 测试水平**：连续变量的推荐水平可以直接删掉，也可以在专门的输入框里填新数值、点「+ 添加」增加自定义水平；温度和补料时间间隔受设备限制，只能在 20/25/30℃、12/24h 里选，不能新增。
+- **输出**：设计生成后可下载配色 Excel（基线/联合探索行底色、"备注/目的"说明列、独立图例 sheet、Excel 自动适配行高），也可以在网页表格里直接回填产量/OD600。填好的 Excel（下载的原文件）或 CSV 都可以原样传回来继续用——上传时会自动把 Excel 的中文表头和"类型"列（如"单变量-发酵温度 (℃)"）还原成内部字段名和 run_type/changed_variable。
+- **可视化**：回填 ≥3 行产量后显示产量/OD600 分布图和变量相关性热力图（Plotly）。
+
+### Round 2：响应面 + 贝叶斯优化
+
+- 可调节显著性分析参数（最大活跃变量数、CCD 步长比例、OD600 阈值比例）
+- 展示活跃变量数 (K) 指标和效应量条形图（按 `effect_magnitude` 排序，含置信区间误差棒和显著性阈值线；置信区间用基线重复的纯误差方差 + t 分布估计，重复数少时区间会偏宽，这是真实的信息量，不是缺陷）
+- 据此生成响应面（CCD）设计表，以及两个独立 GP（产量、OD600）做可行性过滤的约束贝叶斯优化候选点
+
+### 历史记录
+
+本次会话内的 Round 2 快照缓存（`st.session_state`，重启应用后清空，不写入文件）；Round 1 的实测结果走文件保存/下载，不依赖这里的缓存。
+
+## 大肠杆菌 BO 模式（历史，仅供参考）
 
 界面支持两种数据入口：
 
 - 使用 `data/final/run_level_modeling_dataset.csv`
 - 上传已经整理好的 run-level CSV
 
-字段中文显示读取代码里写死的 `summary/supporting_reports/field_dictionary.csv`。该文件的 HMO 版本已归档到 `summary/archive_hmo/supporting_reports/field_dictionary.csv`（本轮文档整理只搬移文件，未同步改代码路径），因此当前这个页签的“字段中英对照”会显示为“尚未生成字段字典”，除非重新运行 `python data/scripts/generate_field_dictionary.py`。同样，“运行推荐”会在 `summary/recommendation_report.md`（旧路径）重新生成报告。该页签展示的是 `standard_bo_qnei`（BoTorch `SingleTaskGP` + qNEI 联合优化整批候选点）推荐、代理模型验证、推荐策略质量、GP 偏依赖图和指标说明；由于 HMO 实验数据已确认无效，此页签的输出不代表当前项目结论，保留仅为界面参考。
+字段中文显示读取代码里写死的 `summary/supporting_reports/field_dictionary.csv`。该文件的 HMO 版本已归档到 `archive/summary/archive_hmo/supporting_reports/field_dictionary.csv`（`summary/` 整个目录后来又被归档到 `archive/summary/`，两轮文档整理都只搬移了文件、未同步改代码路径），因此当前这个页签的"字段中英对照"会显示为"尚未生成字段字典"，除非重新运行 `python data/scripts/generate_field_dictionary.py`。同样，"运行推荐"会在根目录下重新生成一个 `summary/recommendation_report.md`（旧路径，写死在代码里，不是 `archive/summary/`）。该页签展示的是 `standard_bo_qnei`（BoTorch `SingleTaskGP` + qNEI 联合优化整批候选点）推荐、代理模型验证、推荐策略质量、GP 偏依赖图和指标说明；由于 HMO 实验数据已确认无效，此页签的输出不代表当前项目结论，保留仅为界面参考。
