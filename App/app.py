@@ -1260,6 +1260,10 @@ def _pichia_round1_builder() -> None:
     )
 
     st.markdown("##### 单变量法 (OFAT)")
+    st.caption(
+        "连续变量的测试水平不是固定选项——推荐值只是预填，勾掉即可移除，下面还有专门的输入框+按钮可以增加新水平；"
+        "温度和补料间隔受设备限制，只能在 20/25/30℃、12/24h 这几个物理档位里选，不能新增。"
+    )
     ofat_vars = st.multiselect(
         "参与 OFAT 的变量（不选 = 不生成 OFAT 行）",
         list(PICHIA_VARIABLES),
@@ -1271,18 +1275,69 @@ def _pichia_round1_builder() -> None:
     ofat_errors: list[str] = []
     for variable in ofat_vars:
         default_levels = PICHIA_OFAT_LEVELS.get(variable, [])
-        selected = st.multiselect(
-            f"{PICHIA_VARIABLE_LABELS.get(variable, variable)} 的测试水平",
-            options=default_levels,
-            default=default_levels,
-            accept_new_options=True,
-            help="可以直接勾掉/加回推荐水平，也可以在框里输入自定义数值后回车添加。",
-            key=f"round1_builder_ofat_levels_{variable}",
-        )
+        label = PICHIA_VARIABLE_LABELS.get(variable, variable)
+        is_fixed_level = variable in PICHIA_FIXED_LEVELS
+        if is_fixed_level:
+            selected = st.multiselect(
+                f"{label} 的测试水平",
+                options=PICHIA_FIXED_LEVELS[variable],
+                default=default_levels,
+                help="设备只支持这几个固定档位，不能输入自定义数值。",
+                key=f"round1_builder_ofat_levels_{variable}",
+            )
+        else:
+            # explicit pool + add-button instead of relying on multiselect's
+            # accept_new_options=True: that only reveals its "type to add" UI
+            # once the box is clicked/focused, so it looked identical to a
+            # plain fixed-choice dropdown in a screenshot -- not discoverable.
+            # The add-row must run BEFORE the multiselect below: Streamlit
+            # forbids writing to a widget's session_state key after that
+            # widget has already been instantiated in the same script run, so
+            # mutating pool/levels has to happen ahead of the multiselect call
+            # that owns `levels_key`, not in a button handler placed after it.
+            pool_key = f"round1_builder_ofat_pool_{variable}"
+            levels_key = f"round1_builder_ofat_levels_{variable}"
+            st.session_state.setdefault(pool_key, list(default_levels))
+            st.session_state.setdefault(levels_key, list(default_levels))
+
+            lower, upper = PICHIA_CONTINUOUS_BOUNDS[variable]
+            st.caption(f"新增「{label}」测试水平")
+            add_cols = st.columns([3, 1])
+            with add_cols[0]:
+                new_level = st.number_input(
+                    f"新增{label}水平",
+                    min_value=float(lower),
+                    max_value=float(upper),
+                    value=None,
+                    step=0.1,
+                    placeholder="输入数值",
+                    label_visibility="collapsed",
+                    key=f"round1_builder_ofat_newval_{variable}",
+                )
+            with add_cols[1]:
+                add_clicked = st.button(
+                    "+ 添加", width="stretch", key=f"round1_builder_ofat_addbtn_{variable}"
+                )
+            if add_clicked:
+                if new_level is None:
+                    st.warning("请先在左侧输入一个数值。")
+                else:
+                    pool = st.session_state[pool_key]
+                    if new_level not in pool:
+                        st.session_state[pool_key] = sorted(pool + [new_level])
+                    levels = st.session_state[levels_key]
+                    if new_level not in levels:
+                        st.session_state[levels_key] = sorted(levels + [new_level])
+
+            selected = st.multiselect(
+                f"{label} 的测试水平（勾掉即可移除，上方可新增）",
+                options=st.session_state[pool_key],
+                key=levels_key,
+            )
         try:
             ofat_levels_config[variable] = sorted({float(value) for value in selected})
         except (TypeError, ValueError):
-            ofat_errors.append(PICHIA_VARIABLE_LABELS.get(variable, variable))
+            ofat_errors.append(label)
     if ofat_errors:
         st.error(f"以下变量输入了无法识别成数字的自定义水平，请检查：{', '.join(ofat_errors)}")
 
@@ -1575,26 +1630,79 @@ def _pichia_round1_workbook_bytes(df: pd.DataFrame) -> bytes:
             elif row_fill is not None:
                 cell.fill = row_fill
 
-    legend_row = len(df) + 3
-    legend_title = ws.cell(row=legend_row, column=1, value="图例：")
-    legend_title.font = Font(name=font_name, size=10, bold=True)
+    # legend lives on its own sheet, not appended below the data table --
+    # otherwise pd.read_excel() on reimport reads it as extra data rows
+    # (confirmed: it silently inflated an 18-row design to 23 rows).
+    legend_ws = wb.create_sheet("图例说明")
+    legend_ws.sheet_view.showGridLines = False
+    legend_ws.column_dimensions["A"].width = 4
+    legend_ws.column_dimensions["B"].width = 40
     legend_items = [
         (baseline_fill, "基线重复（估计批次噪声）"),
         (combo_fill, "联合探索点（LHS，多变量同时变化）"),
         (fillin_fill, "需要填写的结果列"),
     ]
-    for offset, (fill, text) in enumerate(legend_items):
-        marker_row = legend_row + 1 + offset
-        marker = ws.cell(row=marker_row, column=1, value=" ")
+    for row_idx, (fill, text) in enumerate(legend_items, start=1):
+        marker = legend_ws.cell(row=row_idx, column=1, value=" ")
         marker.fill = fill
         marker.border = border
-        label_cell = ws.cell(row=marker_row, column=2, value=text)
+        label_cell = legend_ws.cell(row=row_idx, column=2, value=text)
         label_cell.font = Font(name=font_name, size=10)
-        ws.merge_cells(start_row=marker_row, start_column=2, end_row=marker_row, end_column=len(columns))
 
     buffer = BytesIO()
     wb.save(buffer)
     return buffer.getvalue()
+
+
+def _pichia_remap_uploaded_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Recognizes the polished Excel export's Chinese headers, in addition to
+    the plain English round1_template_columns() schema, so a design that was
+    downloaded, filled in by hand in Excel, and re-uploaded round-trips
+    correctly. Also reconstructs run_type/changed_variable from the combined
+    "类型" column (e.g. "单变量-发酵温度 (℃)") -- round2's significance
+    analysis and the result charts both key off those two columns, so losing
+    them on reimport would silently break Round 2, not just cosmetics."""
+    label_to_variable = {label: variable for variable, label in PICHIA_VARIABLE_LABELS.items()}
+    rename_map = {
+        "编号": "run_id",
+        "收获时OD600(待填)": PICHIA_OD_COL,
+        "hLF产量(待填)": PICHIA_TARGET_COL,
+    }
+    rename_map.update(label_to_variable)
+    renamed = df.rename(columns=rename_map)
+
+    if "类型" in renamed.columns and "run_type" not in renamed.columns:
+        run_types: list[str | None] = []
+        changed_vars: list[str | None] = []
+        for raw in renamed["类型"]:
+            text = str(raw).strip()
+            if text == PICHIA_RUN_TYPE_LABELS.get("baseline"):
+                run_types.append("baseline")
+                changed_vars.append(None)
+            elif text == PICHIA_RUN_TYPE_LABELS.get("combo"):
+                run_types.append("combo")
+                changed_vars.append(None)
+            elif text.startswith("单变量-"):
+                run_types.append("ofat")
+                changed_vars.append(label_to_variable.get(text[len("单变量-"):]))
+            else:
+                run_types.append(None)
+                changed_vars.append(None)
+        renamed["run_type"] = run_types
+        renamed["changed_variable"] = changed_vars
+        renamed = renamed.drop(columns=["类型"])
+
+    renamed = renamed.drop(columns=["备注/目的"], errors="ignore")
+
+    # defensive: drop any row missing a variable value -- every real design
+    # row has all 6 populated, so this filters out a legend/blank row picked
+    # up from an older export that still had the legend below the table (or
+    # any stray manual annotation row) without needing to special-case it.
+    variable_columns = [variable for variable in PICHIA_VARIABLES if variable in renamed.columns]
+    if variable_columns:
+        renamed = renamed[renamed[variable_columns].notna().all(axis=1)].reset_index(drop=True)
+
+    return renamed
 
 
 def _pichia_round1_tab() -> None:
@@ -1613,11 +1721,19 @@ def _pichia_round1_tab() -> None:
         return
 
     st.markdown("#### 上传已回填结果（可选）")
-    uploaded = st.file_uploader("上传已回填 yield_g_per_l / od600 的 CSV", type=["csv"], key="round1_results_upload")
+    uploaded = st.file_uploader(
+        "上传已回填 yield_g_per_l / od600 的 CSV，或者上面下载的 Excel 填完后原样传回来",
+        type=["csv", "xlsx"],
+        key="round1_results_upload",
+    )
     if uploaded is not None:
         try:
             payload = uploaded.getvalue()
-            uploaded_df = pd.read_csv(BytesIO(payload))
+            if uploaded.name.lower().endswith(".xlsx"):
+                uploaded_df = pd.read_excel(BytesIO(payload))
+            else:
+                uploaded_df = pd.read_csv(BytesIO(payload))
+            uploaded_df = _pichia_remap_uploaded_columns(uploaded_df)
         except Exception as exc:
             st.error(f"读取失败：{exc}")
         else:
@@ -1981,7 +2097,7 @@ def _pichia_history_tab() -> None:
 def _pichia_hlf_page() -> None:
     _ensure_pichia_data_area()
     st.caption(
-        "当前模式：毕赤酵母 hLF 摇瓶实验设计。Round 1 是固定的基线+单变量+联合探索设计，"
+        "当前模式：毕赤酵母 hLF 摇瓶实验设计。Round 1 是可配置的基线+单变量+联合探索设计构建器，"
         "Round 2 基于 Round 1 实测结果做显著性分析、响应面(CCD)设计和约束贝叶斯优化。"
     )
 
