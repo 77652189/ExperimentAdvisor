@@ -6,7 +6,7 @@ import pandas as pd
 
 
 def test_nearest_history_deduplicates_display_columns(monkeypatch):
-    from App import app
+    from App import pages_legacy_ecoli as app
 
     monkeypatch.setattr(
         app,
@@ -50,7 +50,7 @@ def test_nearest_history_deduplicates_display_columns(monkeypatch):
 
 
 def test_dataset_fingerprint_is_stable_across_column_order():
-    from App import app
+    from App import pages_legacy_ecoli as app
 
     left = pd.DataFrame({"a": [1, 2], "b": ["x", "y"]})
     right = left[["b", "a"]].copy()
@@ -59,7 +59,7 @@ def test_dataset_fingerprint_is_stable_across_column_order():
 
 
 def test_recommendation_cache_reads_only_matching_dataset():
-    from App import app
+    from App import pages_legacy_ecoli as app
 
     state = {}
     comparison = {"selected_recommendations": [{"rank": 1}]}
@@ -80,7 +80,7 @@ def test_recommendation_cache_reads_only_matching_dataset():
 
 
 def test_soft_filter_uses_larger_pool_instead_of_supplementing_failures():
-    from App import app
+    from App import pages_legacy_ecoli as app
 
     df = pd.DataFrame(
         {
@@ -124,7 +124,7 @@ def test_soft_filter_uses_larger_pool_instead_of_supplementing_failures():
 
 
 def test_select_without_soft_filters_restores_original_pool():
-    from App import app
+    from App import pages_legacy_ecoli as app
 
     df = pd.DataFrame(
         {
@@ -160,7 +160,7 @@ def test_select_without_soft_filters_restores_original_pool():
 
 
 def test_soft_filter_reports_failure_reason_breakdown():
-    from App import app
+    from App import pages_legacy_ecoli as app
 
     df = pd.DataFrame(
         {
