@@ -5,10 +5,10 @@ from experiment_advisor.ingestion.loader import load_fermentation_data
 from experiment_advisor.ingestion.pipeline import build_final_dataset
 from experiment_advisor.ingestion.run_level import build_run_level_dataset, training_view
 from experiment_advisor.ingestion.validator import validate
-from experiment_advisor.ingestion.excel_schema_converter import (
+from experiment_advisor.ingestion.excel_schema_converter import convert_excel_directory
+from experiment_advisor.ingestion.migration_audit import (
     audit_old_nonblank_value_coverage,
     compare_csv_directories,
-    convert_excel_directory,
     write_detailed_diff_files,
 )
 
