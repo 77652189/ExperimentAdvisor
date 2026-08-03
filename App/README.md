@@ -36,4 +36,4 @@ streamlit run App/app.py
 - 使用 `data/final/run_level_modeling_dataset.csv`
 - 上传已经整理好的 run-level CSV
 
-字段中文显示读取代码里写死的 `summary/supporting_reports/field_dictionary.csv`。该文件的 HMO 版本已归档到 `archive/summary/archive_hmo/supporting_reports/field_dictionary.csv`（`summary/` 整个目录后来又被归档到 `archive/summary/`，两轮文档整理都只搬移了文件、未同步改代码路径），因此当前这个页签的"字段中英对照"会显示为"尚未生成字段字典"，除非重新运行 `python data/scripts/generate_field_dictionary.py`。同样，"运行推荐"会在根目录下重新生成一个 `summary/recommendation_report.md`（旧路径，写死在代码里，不是 `archive/summary/`）。该页签展示的是 `standard_bo_qnei`（BoTorch `SingleTaskGP` + qNEI 联合优化整批候选点）推荐、代理模型验证、推荐策略质量、GP 偏依赖图和指标说明；由于 HMO 实验数据已确认无效，此页签的输出不代表当前项目结论，保留仅为界面参考。
+本页产出统一落在 `archive/summary/`（模块常量 `LEGACY_SUMMARY_DIR`），与该路径的归档定位一致。字段中文显示读取 `archive/summary/supporting_reports/field_dictionary.csv`；该文件不入版本控制，缺失时"字段中英对照"显示为"尚未生成字段字典"，重新运行 `python data/scripts/generate_field_dictionary.py` 即可生成。该页签展示的是 `standard_bo_qnei`（BoTorch `SingleTaskGP` + qNEI 联合优化整批候选点）推荐、代理模型验证、推荐策略质量、GP 偏依赖图和指标说明；由于 HMO 实验数据已确认无效，此页签的输出不代表当前项目结论，保留仅为界面参考。

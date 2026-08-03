@@ -54,7 +54,7 @@ tests/                # 自动化测试
 
 根目录 `data/` 存放真实发酵实验数据，必须保持本地私有，不上传 GitHub。
 
-> `summary/recommendation_report.md` 的生成路径（HMO/2FL 页签的"运行推荐"按钮，以及下面 Python 示例里的 `output_path`）目前仍写死指向根目录 `summary/`，不是 `archive/summary/`——用一次那个按钮会在根目录下重新生成一个只含这一份文件的 `summary/` 文件夹。这是本轮纯文档整理没有同步修改的已知代码路径（该文件本身在 `.gitignore` 里，不会被提交）。
+> HMO/2FL 页签的产出（推荐报告、字段对照表）统一落在 `archive/summary/`，与该路径的归档定位一致（[ADR-0003](docs/adr/0003-legacy-ecoli-fermenter-path-retained-as-reference.md)）。此前这三处写死指向仓库根的 `summary/`，点一次「运行推荐」就会在根目录凭空生成一个只含一份报告的文件夹——而根目录 `summary/` 并不在 `.gitignore` 里。下面 Python 示例里的 `output_path` 是显式入参，按需自行指定。
 
 ## 安装
 
