@@ -19,6 +19,11 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# 本页是保留下来的历史 HMO/2FL 路径（ADR-0003），它的产出一直放在 archive/summary/。
+# 此前这里写死指向仓库根的 summary/，点一次「运行推荐」就会在根目录凭空生成一个
+# 只含一份报告的 summary/ 文件夹——而根目录 summary/ 并不在 .gitignore 里。
+LEGACY_SUMMARY_DIR = PROJECT_ROOT / "archive" / "summary"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -73,7 +78,7 @@ RECOMMENDATION_CACHE_VERSION = "raw-bo-v1"
 RECOMMENDATION_CACHE_KEY = "recommendation_result_cache"
 
 def _load_field_labels() -> dict[str, str]:
-    dictionary_path = PROJECT_ROOT / "summary" / "supporting_reports" / "field_dictionary.csv"
+    dictionary_path = LEGACY_SUMMARY_DIR / "supporting_reports" / "field_dictionary.csv"
     if not dictionary_path.exists():
         return {}
     dictionary = pd.read_csv(dictionary_path)
@@ -443,7 +448,7 @@ def _overview(df: pd.DataFrame) -> None:
         st.dataframe(_display_dataframe(df.head(30), keep_english=True), width="stretch")
 
     with st.expander("字段中英对照", expanded=False):
-        dictionary_path = PROJECT_ROOT / "summary" / "supporting_reports" / "field_dictionary.csv"
+        dictionary_path = LEGACY_SUMMARY_DIR / "supporting_reports" / "field_dictionary.csv"
         if dictionary_path.exists():
             dictionary = pd.read_csv(dictionary_path)
             run_dictionary = dictionary.loc[dictionary["table"] == "run_level_modeling_dataset"].copy()
@@ -1129,7 +1134,7 @@ def _ecoli_legacy_page() -> None:
 
     _overview(df)
     dataset_fingerprint = _dataset_fingerprint(df)
-    report_path = PROJECT_ROOT / "summary" / "recommendation_report.md"
+    report_path = LEGACY_SUMMARY_DIR / "recommendation_report.md"
     cache_message = ""
     if run_button:
         with st.spinner("正在训练标准 GP-BO（qNEI）并生成推荐..."):
