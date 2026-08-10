@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 400" width="700" height="400" role="img" aria-labelledby="t d">
+<title id="t">两条路线并存：选择推迟到数据能作出选择时</title>
+<desc id="d">第一轮实测结果尚未产生。响应面擅长解释原因但要求样本量大且设计严格执行；贝叶斯可用小样本与任意条件但解释性差。两条并行跑在同一批数据上，不劈分样本预算。</desc>
+<defs><marker id="a" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" class="arh"/></marker></defs>
+<style>
+  .bg{fill:#ffffff}
+  .pend{fill:#fdf6e8;stroke:#BA7517;stroke-width:1.5;stroke-dasharray:6 4}
+  .box{fill:#f4f2ec;stroke:#d8d5cc;stroke-width:1}
+  .fl{stroke:#8b8b85;stroke-width:1.6;fill:none}
+  .arh{fill:#8b8b85}
+  .ti{fill:#2c2c2a;font:500 15px system-ui,-apple-system,'Segoe UI',sans-serif}
+  .sim{fill:#8b8b85;font:400 11px system-ui,-apple-system,'Segoe UI',sans-serif;font-style:italic}
+  .h{fill:#2c2c2a;font:500 14px system-ui,-apple-system,'Segoe UI',sans-serif}
+  .warn{fill:#8a5a00;font:500 13px system-ui,-apple-system,'Segoe UI',sans-serif}
+  .s{fill:#5f5e5a;font:400 12px system-ui,-apple-system,'Segoe UI',sans-serif}
+  .note{fill:#5f5e5a;font:400 11.5px system-ui,-apple-system,'Segoe UI',sans-serif}
+  .ok{fill:#0F766E} .bad{fill:#B4B2A9}
+  .okt{fill:#0F766E;font:500 12px system-ui,-apple-system,'Segoe UI',sans-serif}
+  @media (prefers-color-scheme:dark){
+    .bg{fill:#0d1117} .pend{fill:#241c0c;stroke:#EF9F27} .box{fill:#1c1f26;stroke:#3a3d44}
+    .fl{stroke:#8b8b85} .arh{fill:#8b8b85}
+    .ti{fill:#e8e6e0} .sim{fill:#8b8b85} .h{fill:#e8e6e0} .warn{fill:#EF9F27}
+    .s{fill:#b4b2a9} .note{fill:#b4b2a9} .ok{fill:#2fa88f} .bad{fill:#5f5e5a} .okt{fill:#5DCAA5}
+  }
+</style>
+<rect class="bg" x="0" y="0" width="700" height="400"/>
+<text class="ti" x="20" y="26">两条路线都留着 —— 不是不想选，是选择的依据还没产生</text>
+<text class="sim" x="20" y="44">取舍来自项目负责人；并行执行见 round2_design.py 模块 docstring</text>
+
+<rect class="pend" x="238" y="62" width="224" height="50" rx="7"/>
+<text class="warn" x="350" y="84" text-anchor="middle">Round 1 实测结果</text>
+<text class="s" x="350" y="102" text-anchor="middle">尚未产生 —— 项目因此是半成品</text>
+
+<path class="fl" d="M 300 114 L 205 158" marker-end="url(#a)"/>
+<path class="fl" d="M 400 114 L 495 158" marker-end="url(#a)"/>
+
+<rect class="box" x="34" y="162" width="292" height="126" rx="7"/>
+<text class="h" x="52" y="186">响应面分析（CCD）</text>
+<circle class="ok" cx="58" cy="209" r="4"/><text class="s" x="70" y="213">擅长解释原因：因子、效应、交互</text>
+<circle class="bad" cx="58" cy="233" r="4"/><text class="s" x="70" y="237">需要较大样本量</text>
+<circle class="bad" cx="58" cy="257" r="4"/><text class="s" x="70" y="261">设计必须严格执行，缺行就废</text>
+
+<rect class="box" x="374" y="162" width="292" height="126" rx="7"/>
+<text class="h" x="392" y="186">贝叶斯优化</text>
+<circle class="ok" cx="398" cy="209" r="4"/><text class="s" x="410" y="213">快速逼近最优参数</text>
+<circle class="ok" cx="398" cy="233" r="4"/><text class="s" x="410" y="237">小样本可用，接收任意条件数据</text>
+<circle class="bad" cx="398" cy="257" r="4"/><text class="s" x="410" y="261">解释性差</text>
+
+<line x1="34" y1="312" x2="666" y2="312" stroke="#e0ded7" stroke-width="1"/>
+<text class="okt" x="34" y="336">两条并行跑在同一批数据上，不把当轮样本预算劈开。</text>
+<text class="note" x="34" y="360">强项恰好互补，而哪条可行取决于第一轮长什么样：执行严格且效应清晰 → 响应面能给机理；</text>
+<text class="note" x="34" y="380">执行有偏差或效应被噪声盖住 → 只有贝叶斯能用。样本这么少，没预算去赌哪条更好。</text>
+</svg>

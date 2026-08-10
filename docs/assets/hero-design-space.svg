@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 250" width="1000" height="250" role="img" aria-labelledby="t d">
+<title id="t">ExperimentAdvisor</title>
+<desc id="d">Left: a design space holding round one - three replicates clustered at the baseline, one-factor arms along each axis, and a few scattered combination points. Right: the same space with an infeasible band excluded along the bottom, a response-surface star around the best region, and a scattered optimisation batch beside it.</desc>
+<style>
+  .bg{fill:#ffffff}
+  .fr{fill:none;stroke:#d8d5cc;stroke-width:1.5}
+  .ax{stroke:#e6e4dd;stroke-width:1}
+  .base{fill:#2c2c2a}
+  .ofat{fill:#8b8b85}
+  .lhs{fill:#B4B2A9}
+  .ccd{fill:none;stroke:#0F766E;stroke-width:2}
+  .bo{fill:#5DCAA5}
+  .bad{fill:#f1efe8}
+  .badline{stroke:#BA7517;stroke-width:1.5;stroke-dasharray:6 4;fill:none}
+  .arw{fill:#c4c2ba}
+  @media (prefers-color-scheme:dark){
+    .bg{fill:#0d1117} .fr{stroke:#3a3d44} .ax{stroke:#22252b}
+    .base{fill:#e8e6e0} .ofat{fill:#8b8b85} .lhs{fill:#5f5e5a}
+    .ccd{stroke:#2fa88f} .bo{fill:#5DCAA5}
+    .bad{fill:#1a1a1e} .badline{stroke:#EF9F27} .arw{fill:#4a4a46}
+  }
+</style>
+<rect class="bg" x="0" y="0" width="1000" height="250"/>
+
+<rect class="fr" x="90" y="40" width="380" height="170" rx="4"/>
+<line class="ax" x1="280" y1="42" x2="280" y2="208"/>
+<line class="ax" x1="92" y1="125" x2="468" y2="125"/>
+<circle class="ofat" cx="200" cy="125" r="5"/><circle class="ofat" cx="240" cy="125" r="5"/>
+<circle class="ofat" cx="320" cy="125" r="5"/><circle class="ofat" cx="360" cy="125" r="5"/>
+<circle class="ofat" cx="280" cy="70" r="5"/><circle class="ofat" cx="280" cy="95" r="5"/>
+<circle class="ofat" cx="280" cy="155" r="5"/><circle class="ofat" cx="280" cy="180" r="5"/>
+<circle class="lhs" cx="150" cy="75" r="5"/><circle class="lhs" cx="404" cy="88" r="5"/>
+<circle class="lhs" cx="168" cy="182" r="5"/><circle class="lhs" cx="422" cy="176" r="5"/>
+<circle class="base" cx="280" cy="125" r="5.5"/><circle class="base" cx="286" cy="119" r="5.5"/><circle class="base" cx="274" cy="131" r="5.5"/>
+
+<path class="arw" d="M 494 118 L 494 132 L 520 132 L 520 140 L 538 125 L 520 110 L 520 118 Z"/>
+
+<rect class="fr" x="550" y="40" width="380" height="170" rx="4"/>
+<rect class="bad" x="551" y="166" width="378" height="43" rx="3"/>
+<line class="badline" x1="551" y1="166" x2="929" y2="166"/>
+
+<circle class="bo" cx="618" cy="88" r="5"/><circle class="bo" cx="662" cy="132" r="5"/>
+<circle class="bo" cx="600" cy="146" r="5"/><circle class="bo" cx="690" cy="62" r="5"/>
+<circle class="bo" cx="858" cy="80" r="5"/><circle class="bo" cx="886" cy="124" r="5"/>
+<circle class="bo" cx="840" cy="146" r="5"/>
+
+<circle class="ccd" cx="762" cy="104" r="5"/>
+<circle class="ccd" cx="712" cy="104" r="5"/><circle class="ccd" cx="812" cy="104" r="5"/>
+<circle class="ccd" cx="762" cy="62" r="5"/><circle class="ccd" cx="762" cy="146" r="5"/>
+<circle class="ccd" cx="727" cy="76" r="5"/><circle class="ccd" cx="797" cy="76" r="5"/>
+<circle class="ccd" cx="727" cy="132" r="5"/><circle class="ccd" cx="797" cy="132" r="5"/>
+</svg>

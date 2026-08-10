@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 400" width="700" height="400" role="img" aria-labelledby="t d">
+<title id="t">Constrained batch: two independent GPs, filtered rather than jointly optimised</title>
+<desc id="d">Yield and OD600 each get an independent SingleTaskGP. Three thousand candidates are sampled, the OD600 model's prediction filters out infeasible ones, and the survivors are ranked by the yield model's prediction. There is deliberately no joint constrained acquisition function.</desc>
+<defs><marker id="a" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" class="arh"/></marker>
+<marker id="b" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" class="arg"/></marker></defs>
+<style>
+  .bg{fill:#ffffff}
+  .box{fill:#f4f2ec;stroke:#d8d5cc;stroke-width:1}
+  .gp{fill:#e1f5ee;stroke:#0F766E;stroke-width:1.5}
+  .filt{fill:#fdf6e8;stroke:#BA7517;stroke-width:1.5}
+  .fl{stroke:#8b8b85;stroke-width:1.6;fill:none}
+  .dash{stroke:#0F766E;stroke-width:1.3;fill:none;stroke-dasharray:5 4}
+  .arh{fill:#8b8b85} .arg{fill:#0F766E}
+  .ti{fill:#2c2c2a;font:500 15px system-ui,-apple-system,'Segoe UI',sans-serif}
+  .sim{fill:#8b8b85;font:400 11px system-ui,-apple-system,'Segoe UI',sans-serif;font-style:italic}
+  .h{fill:#2c2c2a;font:500 13.5px system-ui,-apple-system,'Segoe UI',sans-serif}
+  .hg{fill:#0b5c4f;font:500 13.5px system-ui,-apple-system,'Segoe UI',sans-serif}
+  .hw{fill:#8a5a00;font:500 13.5px system-ui,-apple-system,'Segoe UI',sans-serif}
+  .s{fill:#5f5e5a;font:400 11.5px system-ui,-apple-system,'Segoe UI',sans-serif}
+  .tag{fill:#0F766E;font:400 11px system-ui,-apple-system,'Segoe UI',sans-serif}
+  .note{fill:#5f5e5a;font:400 11.5px system-ui,-apple-system,'Segoe UI',sans-serif}
+  @media (prefers-color-scheme:dark){
+    .bg{fill:#0d1117} .box{fill:#1c1f26;stroke:#3a3d44} .gp{fill:#0d2e28;stroke:#2fa88f}
+    .filt{fill:#241c0c;stroke:#EF9F27} .fl{stroke:#8b8b85} .dash{stroke:#2fa88f}
+    .arh{fill:#8b8b85} .arg{fill:#2fa88f}
+    .ti{fill:#e8e6e0} .sim{fill:#8b8b85} .h{fill:#e8e6e0} .hg{fill:#7fd9c2} .hw{fill:#EF9F27}
+    .s{fill:#b4b2a9} .tag{fill:#5DCAA5} .note{fill:#b4b2a9}
+  }
+</style>
+<rect class="bg" x="0" y="0" width="700" height="400"/>
+<text class="ti" x="20" y="26">Two independent GPs — but the OD600 one only filters, it never trades off</text>
+<text class="sim" x="20" y="44">Verified against round2_design.py::recommend_round2_bo_batch</text>
+
+<rect class="box" x="250" y="58" width="200" height="42" rx="6"/>
+<text class="h" x="350" y="77" text-anchor="middle">round 1 data</text>
+<text class="s" x="350" y="92" text-anchor="middle">needs 5+ rows with both yield and OD600</text>
+<path class="fl" d="M 300 100 L 210 114" marker-end="url(#a)"/>
+<path class="fl" d="M 400 100 L 490 114" marker-end="url(#a)"/>
+
+<rect class="gp" x="40" y="118" width="260" height="44" rx="6"/>
+<text class="hg" x="170" y="146" text-anchor="middle">SingleTaskGP · yield</text>
+<rect class="gp" x="400" y="118" width="260" height="44" rx="6"/>
+<text class="hg" x="530" y="146" text-anchor="middle">SingleTaskGP · OD600</text>
+
+<rect class="box" x="230" y="180" width="240" height="38" rx="6"/>
+<text class="h" x="350" y="204" text-anchor="middle">sample 3000 candidates</text>
+<path class="fl" d="M 350 218 V 232" marker-end="url(#a)"/>
+
+<rect class="filt" x="190" y="236" width="320" height="42" rx="6"/>
+<text class="hw" x="350" y="262" text-anchor="middle">filter: od_mean ≥ 0.7 × baseline mean</text>
+<path class="dash" d="M 530 162 V 257 H 516" marker-end="url(#b)"/>
+<text class="tag" x="540" y="212">predicts feasibility only</text>
+
+<path class="fl" d="M 350 278 V 292" marker-end="url(#a)"/>
+<rect class="box" x="170" y="296" width="360" height="42" rx="6"/>
+<text class="h" x="350" y="322" text-anchor="middle">rank survivors by predicted yield → batch (n = 9)</text>
+<path class="dash" d="M 170 162 V 317 H 164" marker-end="url(#b)"/>
+<text class="tag" x="46" y="212">used for ranking</text>
+
+<text class="note" x="20" y="364">A filtered candidate does not return for having high yield — so the explanation is "it will not grow", not "it scored lower".</text>
+<text class="note" x="20" y="384">No joint constrained acquisition, deliberately: at 18-40 training points a hand-tuned objective is harder to sanity-check.</text>
+</svg>
