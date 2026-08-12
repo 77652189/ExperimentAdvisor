@@ -562,6 +562,40 @@ def _sample_bo_candidates(
     return pd.DataFrame(rows)
 
 
+def _fit_single_task_gp(train_X: np.ndarray, train_y: np.ndarray, seed: int) -> Any:
+    """Builds and fits one SingleTaskGP the way every GP consumer in this
+    module needs it: Normalize/Standardize transforms, ExactMarginalLogLikelihood,
+    fit_gpytorch_mll, then .eval(). Shared by recommend_round2_bo_batch and
+    gp_leave_one_out_cv so a future change to this recipe (kernel, transform,
+    noise prior) can't be applied to one and silently forgotten in the other
+    -- that drift would make the cross-validation validate a different model
+    than the one actually deployed, defeating its whole point as a trust
+    signal. Callers are responsible for their own import guard (torch etc.
+    may not be installed) since each already needs torch in scope for its
+    own tensor/posterior calls; this only assumes the packages are present.
+    """
+    import torch
+    from botorch.fit import fit_gpytorch_mll
+    from botorch.models import SingleTaskGP
+    from botorch.models.transforms.input import Normalize
+    from botorch.models.transforms.outcome import Standardize
+    from gpytorch.mlls import ExactMarginalLogLikelihood
+
+    torch.manual_seed(seed)
+    train_X_t = torch.tensor(train_X, dtype=torch.double)
+    train_Y_t = torch.tensor(train_y, dtype=torch.double).unsqueeze(-1)
+    model = SingleTaskGP(
+        train_X=train_X_t,
+        train_Y=train_Y_t,
+        input_transform=Normalize(d=train_X_t.shape[-1]),
+        outcome_transform=Standardize(m=1),
+    )
+    mll = ExactMarginalLogLikelihood(model.likelihood, model)
+    fit_gpytorch_mll(mll)
+    model.eval()
+    return model
+
+
 def recommend_round2_bo_batch(
     round1_df: pd.DataFrame,
     fixed_values: dict[str, float],
@@ -586,11 +620,6 @@ def recommend_round2_bo_batch(
 
     try:
         import torch
-        from botorch.fit import fit_gpytorch_mll
-        from botorch.models import SingleTaskGP
-        from botorch.models.transforms.input import Normalize
-        from botorch.models.transforms.outcome import Standardize
-        from gpytorch.mlls import ExactMarginalLogLikelihood
     except Exception as exc:  # pragma: no cover - depends on optional runtime deps
         raise ImportError("recommend_round2_bo_batch requires torch, botorch, and gpytorch.") from exc
 
@@ -599,23 +628,9 @@ def recommend_round2_bo_batch(
     if len(train) < 5:
         raise ValueError("At least 5 complete round-1 rows (with both yield and od600) are required")
 
-    def _fit(train_y: np.ndarray) -> Any:
-        torch.manual_seed(seed)
-        train_X_t = torch.tensor(train[feature_cols].to_numpy(dtype=float), dtype=torch.double)
-        train_Y_t = torch.tensor(train_y, dtype=torch.double).unsqueeze(-1)
-        model = SingleTaskGP(
-            train_X=train_X_t,
-            train_Y=train_Y_t,
-            input_transform=Normalize(d=train_X_t.shape[-1]),
-            outcome_transform=Standardize(m=1),
-        )
-        mll = ExactMarginalLogLikelihood(model.likelihood, model)
-        fit_gpytorch_mll(mll)
-        model.eval()
-        return model
-
-    yield_model = _fit(train[target_col].to_numpy(dtype=float))
-    od_model = _fit(train[od_col].to_numpy(dtype=float))
+    train_X = train[feature_cols].to_numpy(dtype=float)
+    yield_model = _fit_single_task_gp(train_X, train[target_col].to_numpy(dtype=float), seed)
+    od_model = _fit_single_task_gp(train_X, train[od_col].to_numpy(dtype=float), seed)
 
     candidates = _sample_bo_candidates(fixed_values, active_variables, n_candidates, seed)
     candidates = candidates[feature_cols]
@@ -724,11 +739,6 @@ def gp_leave_one_out_cv(
     """
     try:
         import torch
-        from botorch.fit import fit_gpytorch_mll
-        from botorch.models import SingleTaskGP
-        from botorch.models.transforms.input import Normalize
-        from botorch.models.transforms.outcome import Standardize
-        from gpytorch.mlls import ExactMarginalLogLikelihood
     except Exception as exc:  # pragma: no cover - depends on optional runtime deps
         raise ImportError("gp_leave_one_out_cv requires torch, botorch, and gpytorch.") from exc
 
@@ -745,18 +755,7 @@ def gp_leave_one_out_cv(
     for held_out in range(n):
         train_mask = np.ones(n, dtype=bool)
         train_mask[held_out] = False
-        torch.manual_seed(seed)
-        train_X_t = torch.tensor(X_all[train_mask], dtype=torch.double)
-        train_Y_t = torch.tensor(y_all[train_mask], dtype=torch.double).unsqueeze(-1)
-        model = SingleTaskGP(
-            train_X=train_X_t,
-            train_Y=train_Y_t,
-            input_transform=Normalize(d=train_X_t.shape[-1]),
-            outcome_transform=Standardize(m=1),
-        )
-        mll = ExactMarginalLogLikelihood(model.likelihood, model)
-        fit_gpytorch_mll(mll)
-        model.eval()
+        model = _fit_single_task_gp(X_all[train_mask], y_all[train_mask], seed)
         with torch.no_grad():
             posterior = model.posterior(torch.tensor(X_all[held_out : held_out + 1], dtype=torch.double))
             predicted[held_out] = float(posterior.mean.squeeze())
@@ -813,7 +812,19 @@ def summarize_bo_recommendation(
         if cv is None:
             continue
         q2 = cv["q_squared"]
-        if q2 >= 0.5:
+        if pd.isna(q2):
+            # ss_total == 0 (every training value identical) -- Q^2 is
+            # mathematically undefined here, not "bad": a plain >=0.5/>=0.0
+            # comparison against NaN is always False in Python and would
+            # otherwise fall through to the "worse than the mean" branch,
+            # asserting something false about a model this metric simply
+            # can't evaluate.
+            verdicts.append(
+                BoRecommendationVerdict(
+                    "info", f"「{label}」模型的留一法交叉验证暂时算不出 Q²（训练样本里这个指标几乎没有变化），预测能力暂时无法判断。"
+                )
+            )
+        elif q2 >= 0.5:
             verdicts.append(
                 BoRecommendationVerdict("success", f"「{label}」模型的留一法交叉验证 Q²={q2:.3g}，预测能力不错，下面的推荐可以按预测值直接参考。")
             )
@@ -857,7 +868,17 @@ def summarize_bo_recommendation(
     if top is not None:
         std = top.get("predicted_yield_std")
         mean = top.get("predicted_yield")
-        if std is not None and mean:
+        # explicit None-checks, not truthiness: mean == 0.0 is a valid (if
+        # unusual) GP posterior mean and must not be treated the same as
+        # "missing" -- it gets its own branch below instead of silently
+        # dropping the whole verdict the way a plain `if mean:` would.
+        if std is not None and mean is not None and mean == 0:
+            verdicts.append(
+                BoRecommendationVerdict(
+                    "info", f"排第一的推荐点预测产量恰好为 0，无法换算成相对不确定度；预测标准差为 {std:.3g}（绝对值）。"
+                )
+            )
+        elif std is not None and mean is not None:
             relative_uncertainty = std / abs(mean)
             if relative_uncertainty > 0.3:
                 verdicts.append(

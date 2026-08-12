@@ -1430,18 +1430,25 @@ def _pichia_coefficient_table(fit: Any) -> pd.DataFrame:
         )
     return pd.DataFrame(rows)
 
-def _pichia_render_response_surface_verdicts(verdicts: list[Any]) -> None:
-    """Renders summarize_response_surface's output. verdict.message uses bare
-    variable names (round2_design.py has no Chinese-label dict of its own,
-    by design -- it stays UI-agnostic); swap in PICHIA_VARIABLE_LABELS here,
-    at the one place that actually needs the translation, rather than
-    threading a label dict into the analysis layer."""
-    renderers = {"success": st.success, "info": st.info, "warning": st.warning}
+PICHIA_VERDICT_RENDERERS = {"success": st.success, "info": st.info, "warning": st.warning}
+
+def _pichia_render_verdicts(verdicts: list[Any], translate: dict[str, str] | None = None) -> None:
+    """Shared severity->st.* dispatch for any verdict list shaped like
+    ResponseSurfaceVerdict/BoRecommendationVerdict (a .severity/.message
+    pair). `translate`, when given, swaps bare「name」placeholders for
+    Chinese labels -- round2_design.py's response-surface verdicts need
+    this (it stays UI-agnostic, no label dict of its own); its BO verdicts
+    don't, since summarize_bo_recommendation already writes fully Chinese
+    messages with no placeholders to translate."""
     for verdict in verdicts:
         message = verdict.message
-        for variable, label in PICHIA_VARIABLE_LABELS.items():
-            message = message.replace(f"「{variable}」", f"「{label}」")
-        renderers.get(verdict.severity, st.info)(message)
+        if translate:
+            for name, label in translate.items():
+                message = message.replace(f"「{name}」", f"「{label}」")
+        PICHIA_VERDICT_RENDERERS.get(verdict.severity, st.info)(message)
+
+def _pichia_render_response_surface_verdicts(verdicts: list[Any]) -> None:
+    _pichia_render_verdicts(verdicts, translate=PICHIA_VARIABLE_LABELS)
 
 PICHIA_SENSITIVITY_HELP: dict[str, str] = {
     "变量": "该活跃变量。",
@@ -1627,9 +1634,24 @@ def _pichia_render_response_surface_deep_dive(
     if case == "normal":
         st.caption("以上分析（含上方最优点的置信区间）互相印证：模型形式没问题、最优点不在边界、（若已检验）OD600 可行——建议按前面「下一步建议」安排验证批次。")
 
-def _pichia_response_surface_residual_chart(fit: Any, df: pd.DataFrame) -> go.Figure:
-    predicted = evaluate_response_surface(fit, df)
-    actual = df[PICHIA_TARGET_COL].to_numpy(dtype=float)
+def _pichia_predicted_vs_actual_chart(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    *,
+    title: str,
+    x_title: str,
+    y_title: str,
+    point_name: str,
+    hovertemplate: str,
+    height: int = 340,
+    text: pd.Series | None = None,
+    error_y: np.ndarray | None = None,
+) -> go.Figure:
+    """Shared predicted-vs-actual scatter + y=x reference line -- the same
+    diagnostic shape (a fitted model's own predictions on points it's
+    evaluated against, however those predictions were obtained) whether
+    the caller is the CCD fit's plain residual chart or the GP leave-one-out
+    CV's held-out-prediction chart; only the labels/data/error bars differ."""
     lo = float(min(actual.min(), predicted.min()))
     hi = float(max(actual.max(), predicted.max()))
     fig = go.Figure()
@@ -1642,22 +1664,37 @@ def _pichia_response_surface_residual_chart(fit: Any, df: pd.DataFrame) -> go.Fi
             y=predicted,
             mode="markers",
             marker=dict(color=PICHIA_ACCENT_COLOR, size=8),
-            text=df["run_id"] if "run_id" in df.columns else None,
-            hovertemplate="%{text}<br>实测: %{x:.4g}<br>预测: %{y:.4g}<extra></extra>",
-            name="CCD 样本",
+            text=text,
+            error_y=dict(type="data", array=error_y, visible=True, color=PICHIA_MUTED_COLOR) if error_y is not None else None,
+            hovertemplate=hovertemplate,
+            name=point_name,
         )
     )
     fig.update_layout(
-        title="预测值 vs 实测值（残差诊断，越贴近虚线越好）",
+        title=title,
         template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        xaxis_title="实测产量",
-        yaxis_title="预测产量",
+        xaxis_title=x_title,
+        yaxis_title=y_title,
         margin=dict(t=50, b=40, l=60, r=30),
-        height=340,
+        height=height,
     )
     return fig
+
+def _pichia_response_surface_residual_chart(fit: Any, df: pd.DataFrame) -> go.Figure:
+    predicted = evaluate_response_surface(fit, df)
+    actual = df[PICHIA_TARGET_COL].to_numpy(dtype=float)
+    return _pichia_predicted_vs_actual_chart(
+        actual,
+        predicted,
+        title="预测值 vs 实测值（残差诊断，越贴近虚线越好）",
+        x_title="实测产量",
+        y_title="预测产量",
+        point_name="CCD 样本",
+        hovertemplate="%{text}<br>实测: %{x:.4g}<br>预测: %{y:.4g}<extra></extra>",
+        text=df["run_id"] if "run_id" in df.columns else None,
+    )
 
 def _pichia_response_surface_curve_chart(fit: Any, df: pd.DataFrame, variable: str) -> go.Figure:
     x_values = np.linspace(float(df[variable].min()), float(df[variable].max()), 61)
@@ -1880,41 +1917,20 @@ def _pichia_render_bo_verdicts(bo_result: dict[str, Any], cv_result: dict[str, A
     yield_cv = cv_result["yield"] if cv_result else None
     od_cv = cv_result["od"] if cv_result else None
     verdicts = summarize_bo_recommendation(bo_result, yield_cv=yield_cv, od_cv=od_cv)
-    renderers = {"success": st.success, "info": st.info, "warning": st.warning}
-    for verdict in verdicts:
-        renderers.get(verdict.severity, st.info)(verdict.message)
+    _pichia_render_verdicts(verdicts)
 
 def _pichia_bo_cv_residual_chart(cv: dict[str, Any], label: str) -> go.Figure:
-    actual = cv["actual"]
-    predicted = cv["predicted"]
-    lo = float(min(actual.min(), predicted.min()))
-    hi = float(max(actual.max(), predicted.max()))
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines", line=dict(color=PICHIA_MUTED_COLOR, dash="dash"), name="y=x", hoverinfo="skip")
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=actual,
-            y=predicted,
-            mode="markers",
-            marker=dict(color=PICHIA_ACCENT_COLOR, size=8),
-            error_y=dict(type="data", array=cv["predicted_std"], visible=True, color=PICHIA_MUTED_COLOR),
-            name="留一法预测",
-            hovertemplate="实测: %{x:.4g}<br>留一法预测: %{y:.4g}<extra></extra>",
-        )
-    )
-    fig.update_layout(
+    return _pichia_predicted_vs_actual_chart(
+        cv["actual"],
+        cv["predicted"],
         title=f"{label}：留一法预测 vs 实测（误差线是 GP 自己的预测标准差）",
-        template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        xaxis_title="实测",
-        yaxis_title="留一法预测",
-        margin=dict(t=50, b=40, l=60, r=30),
+        x_title="实测",
+        y_title="留一法预测",
+        point_name="留一法预测",
+        hovertemplate="实测: %{x:.4g}<br>留一法预测: %{y:.4g}<extra></extra>",
         height=320,
+        error_y=cv["predicted_std"],
     )
-    return fig
 
 PICHIA_BO_CV_HELP: dict[str, str] = {
     "Q²": "留一法交叉验证的预测能力：每次把一个样本从训练集里拿掉、用剩下的重新拟合再预测这个点，和实测值比较算出的类 R² 指标。"
@@ -1952,11 +1968,6 @@ def _pichia_render_bo_recommendation_section(
         rows.append(row)
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
-    cv_result = st.session_state.get(cv_session_key)
-    _pichia_render_bo_verdicts(bo_result, cv_result)
-
-    _pichia_render_bo_gp_pdp(bo_result, active_variables)
-
     with st.expander("模型校验（留一法交叉验证，判断这个 GP 能信到什么程度）", expanded=False):
         st.caption(
             "对训练数据逐个样本做「留一法」：把这个样本从训练集里拿掉，用剩下的重新拟合 GP，预测被拿掉的这个点，"
@@ -1964,19 +1975,37 @@ def _pichia_render_bo_recommendation_section(
             "样本量不大，但每次点击都会重新拟合多次模型，需要几秒到几十秒，不会自动运行。"
         )
         if st.button("运行交叉验证", key=f"{cv_session_key}_run_button"):
+            # same row selection recommend_round2_bo_batch itself used
+            # (dropna on BOTH target columns, not just the one being
+            # validated this call) -- otherwise, whenever backfill is
+            # partial (yield filled but OD600 not, or vice versa), this
+            # would silently validate against a different, larger row set
+            # than the one that actually produced yield_model/od_model.
+            cv_train_df = train_df.dropna(subset=[PICHIA_TARGET_COL, PICHIA_OD_COL])
             try:
-                yield_cv = gp_leave_one_out_cv(train_df, bo_result["feature_cols"], PICHIA_TARGET_COL)
-                od_cv = gp_leave_one_out_cv(train_df, bo_result["feature_cols"], PICHIA_OD_COL)
+                yield_cv = gp_leave_one_out_cv(cv_train_df, bo_result["feature_cols"], PICHIA_TARGET_COL)
+                od_cv = gp_leave_one_out_cv(cv_train_df, bo_result["feature_cols"], PICHIA_OD_COL)
             except ImportError:
                 st.warning("当前环境未安装 torch/botorch/gpytorch，无法运行交叉验证。")
             except ValueError as exc:
                 st.warning(f"交叉验证暂时无法运行：{exc}")
+            except Exception as exc:
+                st.warning(f"交叉验证运行失败（样本量很小时，某一折的模型拟合可能数值不稳定）：{exc}")
             else:
                 st.session_state[cv_session_key] = {"yield": yield_cv, "od": od_cv}
-                st.rerun()
 
+        # read session_state here, after the button block above may have
+        # just written to it -- lets a fresh result show immediately on the
+        # same click without needing st.rerun() (which would otherwise
+        # re-execute this whole page, including refitting the CCD model for
+        # the combined-data call site, just to re-read a variable that was
+        # bound too early).
+        cv_result = st.session_state.get(cv_session_key)
         if cv_result:
             _pichia_render_bo_cv_result(cv_result)
+
+    _pichia_render_bo_verdicts(bo_result, st.session_state.get(cv_session_key))
+    _pichia_render_bo_gp_pdp(bo_result, active_variables)
 
 def _pichia_round2_results_analysis_section(plan: Round2Plan, round1_df: pd.DataFrame) -> None:
     """What becomes analyzable once the Round 2 sheet above is actually

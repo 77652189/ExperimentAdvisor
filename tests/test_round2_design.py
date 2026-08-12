@@ -1162,3 +1162,25 @@ def test_summarize_bo_recommendation_reports_both_targets_independently():
 
     assert any(v.severity == "success" and "产量" in v.message for v in verdicts)
     assert any(v.severity == "warning" and "OD600" in v.message for v in verdicts)
+
+
+def test_summarize_bo_recommendation_treats_nan_q_squared_as_undecided_not_negative():
+    # ss_total == 0 (every training value identical) makes gp_leave_one_out_cv
+    # return q_squared = nan -- `nan >= 0.5`/`nan >= 0.0` are both False in
+    # Python, so without an explicit NaN branch this used to fall through to
+    # the "worse than guessing the mean" warning, asserting something false
+    # about a model this metric simply can't evaluate.
+    verdicts = summarize_bo_recommendation(_bo_result_stub(), yield_cv={"q_squared": float("nan")})
+
+    assert any(v.severity == "info" and "算不出" in v.message for v in verdicts)
+    assert not any("负值" in v.message or "不如直接猜" in v.message for v in verdicts)
+
+
+def test_summarize_bo_recommendation_handles_zero_predicted_yield_without_crashing():
+    # predicted_yield == 0.0 exactly must not be treated as "missing" (a
+    # plain `if mean:` truthiness check would silently drop this verdict)
+    # nor divide by zero -- it gets its own absolute-value message instead
+    # of a relative-uncertainty one.
+    verdicts = summarize_bo_recommendation(_bo_result_stub(top_yield=0.0, top_std=0.001))
+
+    assert any("恰好为 0" in v.message and "0.001" in v.message for v in verdicts)
