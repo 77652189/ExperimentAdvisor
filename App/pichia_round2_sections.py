@@ -595,6 +595,49 @@ def _pichia_round2_surface_section(plan: Round2Plan, round1_df: pd.DataFrame) ->
         elif result["interaction_significant"] is False:
             st.caption(f"「补料间隔 {extra_interval_level:g}h」的效应在两个「{label}」水平下差不多，可以当一个不依赖「{label}」的主效应来看。")
 
+# Every input recommend_round2_bo_batch is fed. The generated batch lives in
+# session_state and outlives the run that produced it, so if any of these moves
+# afterwards the recommendations on screen stop corresponding to what the page is
+# showing -- and the "模型校验" Q² below them, which always refits on the current
+# data, would be scoring a different model than the one that produced them.
+# Row count alone doesn't catch it: correcting one already-filled yield leaves
+# the count untouched, and the 分析参数 sliders feed the same call.
+_PICHIA_BO_SIGNATURE_LABELS: list[tuple[str, str]] = [
+    ("n_rows", "合并数据的行数"),
+    ("data_hash", "已回填的数值"),
+    ("active_variables", "活跃变量"),
+    ("fixed_values", "固定变量取值"),
+    ("od_threshold", "OD600 约束阈值"),
+    ("n_batch", "建议批次大小"),
+]
+
+def _pichia_bo_run_signature(combined_df: pd.DataFrame, plan: Round2Plan, n_batch: int) -> dict[str, Any]:
+    """The BO call's inputs reduced to something comparable across reruns."""
+    return {
+        "n_rows": int(len(combined_df)),
+        "data_hash": int(pd.util.hash_pandas_object(combined_df, index=False).sum()),
+        "active_variables": tuple(plan.active_variables),
+        "fixed_values": tuple(sorted((name, float(value)) for name, value in plan.fixed_values.items())),
+        "od_threshold": float(plan.od_threshold["threshold"]),
+        "n_batch": int(n_batch),
+    }
+
+def _pichia_bo_staleness_reasons(trained_on: dict[str, Any] | None, current: dict[str, Any]) -> list[str]:
+    """Which BO inputs moved since the stored batch was generated, as Chinese
+    labels ready to drop into a sentence. Empty means the recommendations still
+    match the page.
+
+    A changed row count already implies changed values, so `data_hash` is
+    suppressed in that case instead of being reported as a second reason.
+    """
+    if not trained_on:
+        return []
+    changed = [field for field, _ in _PICHIA_BO_SIGNATURE_LABELS if trained_on.get(field) != current.get(field)]
+    if "n_rows" in changed and "data_hash" in changed:
+        changed.remove("data_hash")
+    labels = dict(_PICHIA_BO_SIGNATURE_LABELS)
+    return [labels[field] for field in changed]
+
 def _pichia_round2_combined_bo_section(plan: Round2Plan, round1_df: pd.DataFrame) -> None:
     """Bayesian optimisation over Round 1 + whatever Round 2 is backfilled so
     far -- the ADR-0009 track that keeps running alongside the response surface
@@ -612,6 +655,7 @@ def _pichia_round2_combined_bo_section(plan: Round2Plan, round1_df: pd.DataFrame
         ignore_index=True,
     )
     n_batch_combined = st.slider("建议批次大小", min_value=3, max_value=15, value=9, key="round2_combined_bo_batch_size")
+    signature = _pichia_bo_run_signature(combined_df, plan, int(n_batch_combined))
     if st.button("用合并数据生成贝叶斯优化建议", type="primary", key="run_combined_bo"):
         try:
             bo_result = recommend_round2_bo_batch(
@@ -629,6 +673,7 @@ def _pichia_round2_combined_bo_section(plan: Round2Plan, round1_df: pd.DataFrame
             st.warning(f"贝叶斯优化建议生成失败（样本量很小时，GP 拟合可能数值不稳定）：{exc}")
         else:
             st.session_state["round2_combined_bo_result"] = bo_result
+            st.session_state["round2_combined_bo_signature"] = signature
             st.success(
                 f"已用 {len(combined_df)} 行合并数据生成 {len(bo_result['recommendations'])} 个建议"
                 f"（候选池 {bo_result['n_candidates']} 个，满足约束 {bo_result['n_feasible']} 个）。"
@@ -636,6 +681,17 @@ def _pichia_round2_combined_bo_section(plan: Round2Plan, round1_df: pd.DataFrame
 
     combined_bo_result = st.session_state.get("round2_combined_bo_result")
     if combined_bo_result:
+        stale_reasons = _pichia_bo_staleness_reasons(
+            st.session_state.get("round2_combined_bo_signature"), signature
+        )
+        if stale_reasons:
+            st.warning(
+                "下面这批建议是**更早生成**的，之后「"
+                + "、".join(stale_reasons)
+                + "」已经变了——它没有用上现在这份数据/参数。重新点一次上面的按钮才会跟上；"
+                "在那之前也别看下面的「模型校验」，它的 Q² 是按当前数据重新训练算的，"
+                "和这批旧建议不是同一个模型。"
+            )
         _pichia_render_bo_recommendation_section(
             combined_bo_result, plan.active_variables, combined_df, "round2_combined_bo_cv_result"
         )

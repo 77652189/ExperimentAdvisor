@@ -24,7 +24,11 @@ from App.pichia_results_io import (
     _pichia_remap_uploaded_columns,
 )
 from App.pichia_round2_bo_views import _pichia_bo_cv_training_rows
-from App.pichia_round2_sections import _pichia_simulate_round2_results
+from App.pichia_round2_sections import (
+    _pichia_bo_run_signature,
+    _pichia_bo_staleness_reasons,
+    _pichia_simulate_round2_results,
+)
 
 
 def _row(run_id: str = "R1-01", yield_value=13.0, yield_header: str = "hLF产量（mg/L）(待填)", **extra) -> dict:
@@ -276,3 +280,92 @@ def test_bo_cv_training_rows_requires_both_targets_present():
     result = _pichia_bo_cv_training_rows(df)
 
     assert list(result["run_id"]) == ["R1", "R4"]
+
+
+def _bo_plan(active=("ph", "glucose_pct"), od_threshold=20.0, fixed=None):
+    """Minimal stand-in for the plan fields the BO signature reads."""
+    from experiment_advisor.recommendation.round2_design import Round2Plan
+
+    return Round2Plan(
+        fixed_values=dict(fixed or {"temp_c": 30.0}),
+        active_variables=list(active),
+        boundary_notes={},
+        overflow_notes={},
+        untested_notes={},
+        design_rows=[],
+        combo_interactions=[],
+        od_threshold={"threshold": od_threshold},
+        noise={},
+        effects={},
+    )
+
+
+def _bo_training_frame(yields=(0.01, 0.02, 0.03)):
+    return pd.DataFrame(
+        {
+            "run_id": [f"R{i}" for i in range(1, len(yields) + 1)],
+            "ph": [6.0] * len(yields),
+            PICHIA_TARGET_COL: list(yields),
+            PICHIA_OD_COL: [30.0] * len(yields),
+        }
+    )
+
+
+def test_bo_staleness_is_quiet_when_nothing_changed():
+    plan = _bo_plan()
+    signature = _pichia_bo_run_signature(_bo_training_frame(), plan, 9)
+
+    # a rerun that changed nothing must not accuse the stored batch of being stale
+    again = _pichia_bo_run_signature(_bo_training_frame(), plan, 9)
+
+    assert _pichia_bo_staleness_reasons(signature, again) == []
+
+
+def test_bo_staleness_catches_an_edited_value_at_unchanged_row_count():
+    # the case a row count alone misses: correcting one already-filled yield.
+    # This is the likelier way the training data moves -- the data_editor is the
+    # main backfill path, so a typo fix never changes how many rows there are.
+    plan = _bo_plan()
+    before = _pichia_bo_run_signature(_bo_training_frame((0.01, 0.02, 0.03)), plan, 9)
+    after = _pichia_bo_run_signature(_bo_training_frame((0.01, 0.02, 0.099)), plan, 9)
+
+    assert before["n_rows"] == after["n_rows"]
+    assert _pichia_bo_staleness_reasons(before, after) == ["已回填的数值"]
+
+
+def test_bo_staleness_reports_row_count_without_also_blaming_the_values():
+    plan = _bo_plan()
+    before = _pichia_bo_run_signature(_bo_training_frame((0.01, 0.02, 0.03)), plan, 9)
+    after = _pichia_bo_run_signature(_bo_training_frame((0.01, 0.02, 0.03, 0.04)), plan, 9)
+
+    # more rows necessarily changes the content hash too; saying so twice reads
+    # like two independent problems
+    assert _pichia_bo_staleness_reasons(before, after) == ["合并数据的行数"]
+
+
+@pytest.mark.parametrize(
+    "changed_plan, changed_batch, expected",
+    [
+        (_bo_plan(active=("ph",)), 9, ["活跃变量"]),
+        (_bo_plan(fixed={"temp_c": 25.0}), 9, ["固定变量取值"]),
+        (_bo_plan(od_threshold=24.0), 9, ["OD600 约束阈值"]),
+        (_bo_plan(), 12, ["建议批次大小"]),
+    ],
+)
+def test_bo_staleness_catches_the_analysis_parameters_too(changed_plan, changed_batch, expected):
+    # the 分析参数 / batch-size sliders sit above the stored batch and are far
+    # easier to nudge than re-uploading data, but they feed the same BO call
+    frame = _bo_training_frame()
+    before = _pichia_bo_run_signature(frame, _bo_plan(), 9)
+    after = _pichia_bo_run_signature(frame, changed_plan, changed_batch)
+
+    assert _pichia_bo_staleness_reasons(before, after) == expected
+
+
+def test_bo_staleness_says_nothing_when_no_batch_was_ever_stored():
+    # first visit: session_state has no signature yet, and there are no
+    # recommendations on screen to be stale
+    current = _pichia_bo_run_signature(_bo_training_frame(), _bo_plan(), 9)
+
+    assert _pichia_bo_staleness_reasons(None, current) == []
+    assert _pichia_bo_staleness_reasons({}, current) == []
