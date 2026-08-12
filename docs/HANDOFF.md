@@ -10,16 +10,14 @@ next_action: obtain_reviewed_round2_measurements
 
 Round 1 已用真实数据（菌株 Y103，16 个条件）完成回填与分析。基于这批数据生成的真实 Round 2 设计（响应面 CCD 18 点 + 补料间隔交互 2 点 + 噪声参考 2 点 + LHS 10 点，共 32 个条件）已经就位，等待摇瓶实验实际执行、产量与 OD600 回填。**负责搭建这套 Round 1/2 分析流程的同事已离职**，回填后的分析（CCD 响应面拟合、补料间隔交互检验、合并数据贝叶斯优化）需要接手人自己核对结果是否合理——这些分析逻辑用合成数据验证过正确性，但从未跑过真实 Round 2 数据。
 
-## ⚠️ 真实数据不在仓库里，要单独找人拿
+## ⚠️ 真实数据不在仓库里
 
-`.gitignore` 屏蔽了 `data/pichia/uploads/*` 和 `data/pichia/final/*`（ADR-0002，这是有意的：真实发酵数据不入版本控制）。后果是 clone 下来跑不出任何真实结论——**两个文件必须走内部渠道单独交接**：
+`.gitignore` 屏蔽了 `data/pichia/uploads/*` 和 `data/pichia/final/*`（ADR-0002，这是有意的：真实发酵数据不入版本控制）。后果是**单靠 clone 跑不出任何真实结论**，这两个文件走的是仓库之外的渠道：
 
 | 文件 | 内容 | 没有它的后果 |
 |---|---|---|
 | `data/pichia/uploads/2026-08-10-摇瓶发酵 round1-Y103.xlsx` | 真实 Round 1 原始数据（菌株 Y103，16 条件） | 无法从头复核回填过程 |
 | `data/pichia/final/pichia_run_level_dataset.csv` | 回填后的 run-level 数据集，**app 启动时读的就是它** | Round 1 页签是空的；Round 2 设计也生成不了（中心点和边界都来自 Round 1 的效应） |
-
-> **交接负责人请填**：这两个文件从 ____________ 获取（内部渠道 / 联系人）。
 
 注意 `python -m pytest -q` 全绿**不代表数据在位**——所有测试都自带合成数据（见「验证方式」），不会因为缺真实数据而失败。判断数据在不在位，看 `data/pichia/final/pichia_run_level_dataset.csv` 存不存在。
 
