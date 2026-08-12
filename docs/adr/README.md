@@ -18,3 +18,4 @@
 | [0014](0014-response-surface-deep-dive-four-analyses.md) | accepted | 响应面深入分析四件套：置信区间、灵敏度、鞍点/岭线判别、联合满意度，四种边界情况共用一个判据函数。 |
 | [0015](0015-bo-leave-one-out-cv-and-narrative-verdicts.md) | accepted | 贝叶斯优化补上留一法交叉验证(Q²)和叙述性解读，两个 BO 入口合并共用同一段渲染代码。 |
 | [0016](0016-remove-round1-only-bo-preview-and-history-tab.md) | accepted | 删除脱节于 CCD 方法论的 Round1-only 贝叶斯优化预览批次，连带删除唯一依赖它的历史记录页签。 |
+| [0017](0017-pichia-ui-module-boundaries-and-round2-subtabs.md) | accepted | `pages_pichia.py` 拆成 6 个模块（三条边界有测试守着），Round 2 页签切四个子页；接受 `st.tabs` 不懒加载。 |

@@ -38,6 +38,7 @@ def test_adr_index_and_records_are_present():
         "0014-response-surface-deep-dive-four-analyses.md",
         "0015-bo-leave-one-out-cv-and-narrative-verdicts.md",
         "0016-remove-round1-only-bo-preview-and-history-tab.md",
+        "0017-pichia-ui-module-boundaries-and-round2-subtabs.md",
     }
 
 

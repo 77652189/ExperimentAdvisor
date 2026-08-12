@@ -18,6 +18,7 @@
 - App 重启（不是浏览器刷新）会清空 `st.session_state`；`_pichia_restore_persisted_dataset` 在两个页签打开时自动从 `data/pichia/final/` 对应的 CSV 读回，避免"明明保存过、重启后又要重新上传"的体验。
 - Streamlit 默认入口已面向 hLF；旧大肠杆菌/HMO 页面被保留为历史参考。
 - `App/app.py` 按 UI 关注点拆分为 `ui_shared.py`（跨会话缓存 + 共享格式化）、`pages_pichia.py`、`pages_legacy_ecoli.py`；`ingestion/excel_schema_converter.py` 拆分为解析核心与 `migration_audit.py`（新旧数据迁移审计工具）。细节见 git 历史（`archive/REFACTOR_PLAN.md` 留有当时的函数级拆分记录）。
+- Pichia 页面自身又拆了一层（见 ADR-0017）：`pages_pichia.py` 从 2482 行缩到 33 行、只剩顶层页签路由，内容分到 `pichia_common` / `pichia_results_io` / `pichia_round1` / `pichia_round2_surface_views` / `pichia_round2_bo_views` / `pichia_round2_sections` 六个模块，最大 713 行；三条模块边界（common 不依赖同级、响应面视图层不碰 session_state、②子页必须在③④之前执行）在 `tests/test_adr_invariants.py` 里有守卫测试。同时 Round 2 页签内部切成四个子页（显著性分析 / 设计生成与回填 / 响应面结果 / 合并数据贝叶斯优化）——注意 `st.tabs` 不懒加载，分页只解决导航，不减少每次 rerun 的计算量。
 
 ## 待启动 / 待数据工作
 
@@ -27,7 +28,6 @@
 | 评估是否要正式扩展补料间隔到 36h（写入 `FIXED_LEVELS`） | 真实 36h 数据回填、且交互检验结果支持 | 见 ADR-0012，当前有意不做 |
 | 决定是否执行候选点 | 研发和工艺团队审阅候选、风险与资源 | 不由软件自动授权 |
 | 决定 `optimizer/standard_bo.py`（历史 E.coli 路径）与 `recommendation/round2_design.py` 的 `recommend_round2_bo_batch`（Pichia Round 2）两套贝叶斯优化实现是否合并 | 需要真实 Round 2 数据暴露出现有实现的具体不足，或产品侧认为有必要 | 待决策，不阻塞其他工作 |
-| Round 2 页面分页 + `pages_pichia.py` 拆分为多个文件 | 无门控，随时可继续；用户已确认方向，要求先出文件划分清单再动手 | 已和用户对齐（2026-08-12）：Round 2 内部加一层 `st.tabs`（显著性分析/设计生成与回填/响应面结果/合并数据贝叶斯优化 四个子页），`pages_pichia.py`（2482 行，Round2 占一半以上）按职责拆成共享工具/Round1/Round2图表与解读/Round2编排几个模块。尚未开始，下一轮先写清单再实施 |
 
 ## 明确不做
 
