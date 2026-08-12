@@ -30,6 +30,11 @@ def test_adr_index_and_records_are_present():
         "0006-soft-filter-failures-grow-pool-not-backfill.md",
         "0007-round1-variable-set-and-ccd-boundary-rules.md",
         "0008-ofat-levels-are-user-extensible.md",
+        "0009-round2-primary-method-is-ccd-not-pure-bo.md",
+        "0010-round2-replication-is-structural-not-per-point.md",
+        "0011-technical-noise-is-a-separate-diagnostic.md",
+        "0012-new-interval-level-stays-out-of-fixed-levels.md",
+        "0013-ccd-response-surface-fit-design.md",
     }
 
 

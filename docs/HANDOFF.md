@@ -2,29 +2,31 @@
 
 ```yaml
 slice_status: in_progress
-current_slice: prepare_and_execute_pichia_hlf_round1
-next_action: obtain_reviewed_round1_measurements
+current_slice: execute_and_backfill_pichia_hlf_round2
+next_action: obtain_reviewed_round2_measurements
 ```
 
 ## 当前目标
 
-使用已实现的 Round 1 设计完成毕赤酵母 hLF 摇瓶首轮实验，并将真实产量与 OD600 回填到应用中，为 Round 2 分析提供输入。
+Round 1 已用真实数据（菌株 Y103，16 个条件）完成回填与分析。基于这批数据生成的真实 Round 2 设计（响应面 CCD 18 点 + 补料间隔交互 2 点 + 噪声参考 2 点 + LHS 10 点，共 32 个条件）已经就位，等待摇瓶实验实际执行、产量与 OD600 回填。**负责搭建这套 Round 1/2 分析流程的同事已离职**，回填后的分析（CCD 响应面拟合、补料间隔交互检验、合并数据贝叶斯优化）需要接手人自己核对结果是否合理——这些分析逻辑用合成数据验证过正确性，但从未跑过真实 Round 2 数据。
 
 ## 下一步
 
-1. 从默认 Pichia hLF 页面导出或生成 Round 1 实验表。
-2. 由实验团队确认条件后执行摇瓶实验，记录每个样本的产量和 OD600。
-3. 上传/回填结果，检查基线重复与数据完整性，再评审 Round 2 输出。
+1. 在 Pichia hLF 页面的 Round 2 页签，用"生成完整 Round 2 设计"拿到 32 个条件的设计表（Excel 下载），确认已经排期/执行的批次和这份设计一致。
+2. 摇瓶实验执行后，记录每个条件的产量与 OD600，通过同一页签的"上传已回填结果"传回。
+3. 检查"Round 2 结果分析"部分：CCD 响应面的 R²/失拟检验是否合理、补料间隔交互检验的结论、以及要不要用"合并数据后的贝叶斯优化建议"生成 Round 3 候选——这几块逻辑见 `docs/adr/0009` 到 `0013`。
+4. 响应面的可视化（等高线图、系数表、残差图）还没接到界面上，底层函数已完成并测试（`evaluate_response_surface`/`response_surface_grid`，见 `experiment_advisor/recommendation/round2_design.py`），可以直接继续。
 
 ## 必读材料
 
 1. [需求](REQUIREMENTS.md)：目标、验收与不可作出的声明。
 2. [架构](ARCHITECTURE.md)：活跃/历史路径和数据边界。
-3. `tests/test_round1_design.py`、`tests/test_round2_design.py`：设计和分析的可执行约束。
+3. `docs/adr/0009` 至 `0013`：这轮 Round 2 方法论决策（为什么选 CCD、为什么不再要求每点测 2 瓶、技术噪声为什么不并入阈值、新补料间隔为什么没写进共享常量、响应面拟合的具体做法）。
+4. `tests/test_round1_design.py`、`tests/test_round2_design.py`、`tests/test_pages_pichia.py`：设计和分析的可执行约束。
 
 ## 验证方式
 
-运行 `python -m pytest -q`；如改动 Streamlit 页面，再用 `streamlit run App/app.py` 检查默认 Pichia 页面、Round 1 导出/回填与 Round 2 前置提示。
+运行 `python -m pytest -q`；如改动 Streamlit 页面，再用 `streamlit run App/app.py` 检查默认 Pichia 页面、Round 1/2 导出回填与结果分析部分。这个开发环境里 Browser 预览面板经常无法渲染画面，验证 UI 改动时改用 `streamlit.testing.v1.AppTest` 驱动真实按钮点击（本次会话的脚本留在各自开发环境的临时目录，未提交到仓库）。
 
 ## 硬约束
 

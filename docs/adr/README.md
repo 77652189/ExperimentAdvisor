@@ -10,3 +10,8 @@
 | [0006](0006-soft-filter-failures-grow-pool-not-backfill.md) | accepted | 软过滤未通过的推荐通过扩大候选池补足，不用落选候选递补。 |
 | [0007](0007-round1-variable-set-and-ccd-boundary-rules.md) | accepted | Round 1 移除 `glucose_start_time_h`、水平不取全局 min/max；CCD 在硬边界整体平移。 |
 | [0008](0008-ofat-levels-are-user-extensible.md) | accepted | Round 1 的 OFAT 水平允许用户运行时新增自定义值，不锁定为协议默认值。 |
+| [0009](0009-round2-primary-method-is-ccd-not-pure-bo.md) | accepted | Round 2 主方法是响应面(CCD)，贝叶斯优化在合并数据集上持续跑，不是二选一。 |
+| [0010](0010-round2-replication-is-structural-not-per-point.md) | accepted | Round 2 的重复靠设计结构（CCD 中心点），角点/轴点/LHS 点不再默认每点测 2 瓶。 |
+| [0011](0011-technical-noise-is-a-separate-diagnostic.md) | accepted | 技术重复噪声只作独立诊断展示，不并入现有显著性阈值。 |
+| [0012](0012-new-interval-level-stays-out-of-fixed-levels.md) | accepted | 新补料间隔水平(36h)通过专门交互子设计探索，不写入共享的 `FIXED_LEVELS`。 |
+| [0013](0013-ccd-response-surface-fit-design.md) | accepted | CCD 响应面拟合：全二次 OLS 模型、中心点估纯误差、最优点只搜已测范围。 |

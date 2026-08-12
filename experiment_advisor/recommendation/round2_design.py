@@ -23,6 +23,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from experiment_advisor.utils.lhs import latin_hypercube
+
 TARGET_COL = "yield_g_per_l"
 OD_COL = "od600"
 
@@ -98,6 +100,12 @@ class FactorEffect:
     at_upper_bound: bool = False
     ci_low: float = 0.0  # confidence interval on effect_magnitude, see effect_confidence_interval()
     ci_high: float = 0.0
+    # True when tested_values holds only the baseline level -- round 1 skipped this
+    # variable's OFAT block entirely, so "not significant" here means "never tried",
+    # not "tried and found flat". Round 1 execution can legitimately drop a variable's
+    # OFAT block (equipment/scheduling limits), so this must stay a flag round 2 can
+    # act on rather than an error.
+    untested: bool = False
 
 
 def effect_confidence_interval(
@@ -180,6 +188,7 @@ def analyze_round1_effects(
         ]
         effect_magnitude = max(non_baseline_deviations) if non_baseline_deviations else 0.0
         significant = effect_magnitude > threshold
+        untested = not non_baseline_deviations
 
         at_lower = at_upper = False
         if kind == "continuous":
@@ -205,6 +214,7 @@ def analyze_round1_effects(
             at_upper_bound=at_upper,
             ci_low=ci_low,
             ci_high=ci_high if pd.notna(ci_high) else effect_magnitude,
+            untested=untested,
         )
 
     return {
@@ -278,7 +288,8 @@ class Round2Variable:
     active: bool
     fixed_value: float | None
     boundary_note: str | None = None
-    note_kind: str | None = None  # "boundary" | "overflow", distinguishes the two note reasons
+    note_kind: str | None = None  # "boundary" | "overflow" | "untested", distinguishes the note reasons
+    untested: bool = False
 
 
 def resolve_round2_variables(
@@ -294,16 +305,32 @@ def resolve_round2_variables(
     can afford within a 15-20 sample round).
     """
 
+    def _fixed(effect: FactorEffect) -> Round2Variable:
+        note = None
+        if effect.untested:
+            note = (
+                f"round 1 未对该变量做单变量测试（没有任何行只改它、其余维持基线），"
+                f"固定在 {effect.best_value:g} 只是沿用基线取值，不代表已验证比其它水平更好"
+            )
+        return Round2Variable(
+            variable=effect.variable,
+            active=False,
+            fixed_value=effect.best_value,
+            boundary_note=note,
+            note_kind="untested" if note else None,
+            untested=effect.untested,
+        )
+
     resolved: dict[str, Round2Variable] = {}
     continuous_candidates = []
     for variable, effect in effects.items():
         if effect.kind == "fixed_level":
-            resolved[variable] = Round2Variable(variable=variable, active=False, fixed_value=effect.best_value)
+            resolved[variable] = _fixed(effect)
             continue
         if effect.significant:
             continuous_candidates.append(effect)
         else:
-            resolved[variable] = Round2Variable(variable=variable, active=False, fixed_value=effect.best_value)
+            resolved[variable] = _fixed(effect)
 
     # Sort by effect_magnitude (max |deviation from baseline|), not "best minus baseline":
     # a variable whose response peaks AT baseline (e.g. pH in the worked example) has
@@ -455,6 +482,7 @@ class Round2Plan:
     active_variables: list[str]
     boundary_notes: dict[str, str]
     overflow_notes: dict[str, str]
+    untested_notes: dict[str, str]
     design_rows: list[dict[str, Any]]
     combo_interactions: list[dict[str, Any]]
     od_threshold: dict[str, Any]
@@ -482,6 +510,7 @@ def plan_round2(
     active_effects = [effects[name] for name in active_names]
     boundary_notes = {name: var.boundary_note for name, var in resolved.items() if var.note_kind == "boundary"}
     overflow_notes = {name: var.boundary_note for name, var in resolved.items() if var.note_kind == "overflow"}
+    untested_notes = {name: var.boundary_note for name, var in resolved.items() if var.note_kind == "untested"}
 
     ccd_rows = generate_ccd(active_effects, step_fraction=ccd_step_fraction)
     design_rows = []
@@ -495,6 +524,7 @@ def plan_round2(
         active_variables=active_names,
         boundary_notes=boundary_notes,
         overflow_notes=overflow_notes,
+        untested_notes=untested_notes,
         design_rows=design_rows,
         combo_interactions=analysis["combo_interactions"],
         od_threshold=od600_threshold(round1_df, baseline, od_col=od_col, fraction=od_threshold_fraction),
@@ -616,4 +646,639 @@ def recommend_round2_bo_batch(
         "n_feasible": int(len(feasible)),
         "n_candidates": int(len(result)),
         "od_threshold": float(od_threshold),
+        # fitted models + the exact column order they were trained on, so a
+        # caller can query .posterior() for visualization (e.g. gp_partial_
+        # dependence below) without refitting -- same principle as ADR-0005
+        # for the legacy E.coli GP plots.
+        "yield_model": yield_model,
+        "od_model": od_model,
+        "feature_cols": feature_cols,
     }
+
+
+def gp_partial_dependence(
+    model: Any,
+    feature_cols: list[str],
+    variable: str,
+    anchor: dict[str, float],
+    lower: float,
+    upper: float,
+    resolution: int = 41,
+) -> dict[str, Any]:
+    """Sweeps `variable` across [lower, upper] holding every other feature in
+    feature_cols at anchor's value, querying an already-fitted GP's posterior
+    mean/std -- a partial-dependence read of what the model itself currently
+    believes, not a refit (same principle as ADR-0005: reuse the fitted model
+    for visualization).
+
+    Unlike fit_ccd_response_surface's optimum search, this deliberately does
+    NOT restrict the sweep to a narrow already-tested band: the GP's training
+    data (round 1's OFAT rows, and any LHS points) already spans each
+    variable's full original range, and the whole point of looking at this
+    plot is to see where the model is confident (near training points) versus
+    guessing (gaps between them) across that full range -- narrowing the
+    sweep would hide exactly the signal this plot exists to show.
+    """
+    import torch
+
+    x_values = np.linspace(lower, upper, resolution)
+    grid = pd.DataFrame({column: [float(anchor[column])] * resolution for column in feature_cols})
+    grid[variable] = x_values
+    X = torch.tensor(grid[feature_cols].to_numpy(dtype=float), dtype=torch.double)
+    with torch.no_grad():
+        posterior = model.posterior(X)
+        mean = posterior.mean.squeeze(-1).cpu().numpy()
+        std = posterior.variance.sqrt().squeeze(-1).cpu().numpy()
+    return {"variable": variable, "x": x_values, "mean": mean, "std": std}
+
+
+ROUND2_TEMPLATE_COLUMNS: list[str] = [
+    "run_id",
+    "run_type",
+    "changed_variable",
+    "reused_from_round1",
+    *ALL_VARIABLES,
+    TARGET_COL,
+    OD_COL,
+]
+
+
+def generate_round2_extension_design(
+    plan: Round2Plan,
+    baseline: dict[str, float],
+    extra_interval_levels: list[float],
+    interaction_variable: str = "glucose_pct",
+    interaction_levels: list[float] | None = None,
+    n_noise_reference: int = 2,
+    n_lhs: int = 10,
+    lhs_variables: list[str] | None = None,
+    lhs_interval_levels: list[float] | None = None,
+    run_id_start: int = 1,
+    run_id_prefix: str = "R2",
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Three extra blocks beyond plan.design_rows (CCD), for testing a feed
+    interval round 1 never tried (e.g. 36h, beyond round 1's 12/24h) --
+    deliberately NOT added to FIXED_LEVELS["interval_h"]/generate_ccd, which
+    stay untouched: generate_ccd only ever varies CONTINUOUS_BOUNDS
+    variables, so a fixed-level variable's new level can't be folded into a
+    response surface, and recommend_round2_bo_batch's candidate grid must not
+    start proposing this interval before any real data at it exists (that
+    would be the GP extrapolating into a total blind spot, not a supported
+    prediction).
+
+    - "interval_interaction": extra_interval_levels crossed with
+      interaction_variable at interaction_levels (default: its round-1 OFAT
+      low/high), everything else at plan.fixed_values -- the smallest design
+      that can tell whether the new interval's effect depends on that
+      variable, since generate_ccd has no mechanism to vary a fixed-level
+      axis itself.
+    - "noise_reference": n_noise_reference replicate rows at the new
+      interval with interaction_variable held at its round-1 baseline value
+      -- round 1's baseline noise says nothing about variability in a feed
+      interval nobody has run yet, and this is the cheapest way to get a
+      real (if rough) noise estimate for it before trusting anything else
+      measured at that interval.
+    - "lhs": n_lhs Latin Hypercube points across lhs_variables (default: the
+      CCD's own active continuous variables), feed interval drawn uniformly
+      from lhs_interval_levels (default: baseline's interval plus
+      extra_interval_levels) -- CCD's corners/axial-arms/center leave gaps a
+      GP has no training signal for; this targets those gaps for whichever
+      BO round consumes the combined dataset next, rather than re-testing
+      what the CCD already covers.
+
+    Deterministic given (plan, baseline, extra_interval_levels, seed): every
+    random draw (LHS point positions, per-LHS-row interval choice) goes
+    through a generator seeded from `seed`, so regenerating with the same
+    arguments reproduces byte-identical rows in the same order -- the design
+    sheet handed to the wet lab must match whatever gets analyzed afterwards.
+    """
+
+    interaction_levels = list(interaction_levels) if interaction_levels is not None else [0.5, 1.5]
+    lhs_variables = list(lhs_variables) if lhs_variables is not None else list(CONTINUOUS_BOUNDS)
+    lhs_interval_levels = (
+        list(lhs_interval_levels) if lhs_interval_levels is not None else [baseline["interval_h"], *extra_interval_levels]
+    )
+
+    counter = run_id_start - 1
+
+    def _next_id() -> str:
+        nonlocal counter
+        counter += 1
+        return f"{run_id_prefix}-{counter:02d}"
+
+    def _base_row() -> dict[str, float]:
+        row = dict(baseline)
+        row.update(plan.fixed_values)
+        return row
+
+    rows: list[dict[str, Any]] = []
+
+    for interval_level in extra_interval_levels:
+        for level in interaction_levels:
+            row = _base_row()
+            row[interaction_variable] = level
+            row["interval_h"] = interval_level
+            rows.append(
+                {"run_id": _next_id(), "run_type": "interval_interaction", "changed_variable": interaction_variable, **row}
+            )
+
+    for interval_level in extra_interval_levels:
+        for _ in range(max(int(n_noise_reference), 0)):
+            row = _base_row()
+            row["interval_h"] = interval_level
+            # explicit, not left to _base_row()'s fallthrough: if
+            # interaction_variable happens to already be in plan.fixed_values
+            # (not active this round), _base_row() would otherwise hold it at
+            # round 1's resolved-best value instead of baseline, making this
+            # reference point's meaning depend on which variables happened to
+            # be active -- pin it to baseline explicitly so it doesn't.
+            row[interaction_variable] = baseline[interaction_variable]
+            rows.append({"run_id": _next_id(), "run_type": "noise_reference", "changed_variable": None, **row})
+
+    n_lhs = max(int(n_lhs), 0)
+    if n_lhs > 0:
+        lhs_unit_values = latin_hypercube(n_lhs, len(lhs_variables), seed=seed)
+        rng = np.random.default_rng(seed)
+        interval_choices = rng.choice(lhs_interval_levels, size=n_lhs)
+        for index in range(n_lhs):
+            row = _base_row()
+            for position, variable in enumerate(lhs_variables):
+                lower, upper = CONTINUOUS_BOUNDS[variable]
+                row[variable] = lower + lhs_unit_values[index][position] * (upper - lower)
+            row["interval_h"] = float(interval_choices[index])
+            rows.append({"run_id": _next_id(), "run_type": "lhs", "changed_variable": None, **row})
+
+    return pd.DataFrame(rows, columns=ROUND2_TEMPLATE_COLUMNS)
+
+
+def assemble_round2_design(
+    plan: Round2Plan,
+    baseline: dict[str, float],
+    round1_df: pd.DataFrame,
+    extra_interval_levels: list[float],
+    interaction_variable: str = "glucose_pct",
+    interaction_levels: list[float] | None = None,
+    n_noise_reference: int = 2,
+    n_lhs: int = 10,
+    lhs_variables: list[str] | None = None,
+    lhs_interval_levels: list[float] | None = None,
+    run_id_prefix: str = "R2",
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Combines plan.design_rows (CCD) with generate_round2_extension_design's
+    three blocks into one flat, sequentially-numbered sheet ready for the wet
+    lab -- a CCD point that already coincides with a round-1 sample
+    ("reused_from_round1") is kept in the sheet, marked as such, AND
+    pre-filled with that round-1 run's actual yield_g_per_l/od600 (looked up
+    from round1_df), rather than left blank for someone to notice the marker
+    and go find the value themselves -- the whole point of flagging a reused
+    point is that nobody has to re-run that flask, so the sheet should say so
+    with the number already in place, not just a note that a number exists
+    somewhere else.
+    """
+
+    round1_by_run_id = round1_df.set_index("run_id") if "run_id" in round1_df.columns else round1_df
+
+    rows: list[dict[str, Any]] = []
+    for index, ccd_row in enumerate(plan.design_rows, start=1):
+        reused = ccd_row.get("reused_from_round1")
+        variables_only = {key: value for key, value in ccd_row.items() if key != "reused_from_round1"}
+        row: dict[str, Any] = {
+            "run_id": f"{run_id_prefix}-{index:02d}",
+            "run_type": "ccd",
+            "changed_variable": None,
+            "reused_from_round1": reused,
+            **variables_only,
+        }
+        if reused and reused in round1_by_run_id.index:
+            source = round1_by_run_id.loc[reused]
+            row[TARGET_COL] = source.get(TARGET_COL)
+            row[OD_COL] = source.get(OD_COL)
+        rows.append(row)
+    ccd_frame = pd.DataFrame(rows, columns=ROUND2_TEMPLATE_COLUMNS)
+
+    extension_frame = generate_round2_extension_design(
+        plan,
+        baseline,
+        extra_interval_levels=extra_interval_levels,
+        interaction_variable=interaction_variable,
+        interaction_levels=interaction_levels,
+        n_noise_reference=n_noise_reference,
+        n_lhs=n_lhs,
+        lhs_variables=lhs_variables,
+        lhs_interval_levels=lhs_interval_levels,
+        run_id_start=len(plan.design_rows) + 1,
+        run_id_prefix=run_id_prefix,
+        seed=seed,
+    )
+
+    return pd.concat([ccd_frame, extension_frame], ignore_index=True)
+
+
+@dataclass(frozen=True)
+class ResponseSurfaceFit:
+    active_variables: list[str]
+    term_names: list[str]
+    coefficients: dict[str, float]
+    coefficient_significance: dict[str, dict[str, float]]  # term -> {se, t_statistic, p_value, significant}
+    r_squared: float
+    n_points: int
+    n_params: int
+    lack_of_fit: dict[str, Any] | None  # None when the design has no replicated point to estimate pure error from
+    optimum: dict[str, float]
+    predicted_optimum: float
+
+
+def _response_surface_design_matrix(df: pd.DataFrame, active_variables: list[str]) -> tuple[np.ndarray, list[str]]:
+    """Full quadratic model: intercept + linear + quadratic + every pairwise
+    interaction among active_variables -- the standard CCD analysis model,
+    matched term-for-term to what generate_ccd's factorial/axial/center
+    points are laid out to estimate."""
+    term_names = ["intercept"]
+    columns = [np.ones(len(df))]
+    for variable in active_variables:
+        term_names.append(variable)
+        columns.append(df[variable].to_numpy(dtype=float))
+    for variable in active_variables:
+        term_names.append(f"{variable}^2")
+        columns.append(df[variable].to_numpy(dtype=float) ** 2)
+    for index, first in enumerate(active_variables):
+        for second in active_variables[index + 1 :]:
+            term_names.append(f"{first}*{second}")
+            columns.append(df[first].to_numpy(dtype=float) * df[second].to_numpy(dtype=float))
+    return np.column_stack(columns), term_names
+
+
+def fit_ccd_response_surface(
+    df: pd.DataFrame,
+    active_variables: list[str],
+    target_col: str = TARGET_COL,
+    grid_resolution: int = 41,
+    tol: float = 1e-6,
+) -> ResponseSurfaceFit:
+    """Fits the standard quadratic response-surface model to a CCD block's
+    results and reports what that fit is actually good for: how well it
+    describes the tested points (R^2), which individual terms are actually
+    distinguishable from noise (coefficient_significance -- a t-test per
+    term using the residual mean square, standard OLS practice, separate
+    from the whole-model lack-of-fit test below), whether the model is
+    missing real curvature (lack-of-fit F-test against the center points'
+    pure error -- the reason generate_ccd always includes several center
+    replicates), and where the fitted surface peaks.
+
+    The optimum is found by grid search over each active variable's own
+    *tested* range (min/max of that variable across df), not the original
+    round-1 CONTINUOUS_BOUNDS -- the fitted quadratic is only trustworthy
+    where the design actually has support; searching past that would be
+    extrapolating a fitted curve into territory nobody measured.
+    """
+
+    rows = df.dropna(subset=[*active_variables, target_col])
+    if len(rows) < 2:
+        raise ValueError("Need at least 2 complete rows to fit a response surface")
+
+    X, term_names = _response_surface_design_matrix(rows, active_variables)
+    y = rows[target_col].to_numpy(dtype=float)
+    n_points, n_params = X.shape
+    if n_points <= n_params:
+        raise ValueError(
+            f"Not enough points ({n_points}) to fit {n_params} parameters for {len(active_variables)} active variable(s)"
+        )
+
+    coefficients_array, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    fitted = X @ coefficients_array
+    residuals = y - fitted
+    ss_residual = float(np.sum(residuals**2))
+    ss_total = float(np.sum((y - y.mean()) ** 2))
+    r_squared = 1.0 - ss_residual / ss_total if ss_total > 0 else 1.0
+    df_residual = n_points - n_params
+
+    lack_of_fit: dict[str, Any] | None = None
+    location_keys = [tuple(round(float(rows.iloc[i][variable]), 6) for variable in active_variables) for i in range(len(rows))]
+    groups: dict[tuple[float, ...], list[float]] = {}
+    for key, value in zip(location_keys, y):
+        groups.setdefault(key, []).append(value)
+    replicated = {key: values for key, values in groups.items() if len(values) > 1}
+    df_pure_error = sum(len(values) - 1 for values in replicated.values())
+    if df_pure_error > 0 and df_residual > df_pure_error:
+        ss_pure_error = sum(float(np.sum((np.array(values) - np.mean(values)) ** 2)) for values in replicated.values())
+        ss_lack_of_fit = ss_residual - ss_pure_error
+        df_lack_of_fit = df_residual - df_pure_error
+        if ss_pure_error > 0 and df_lack_of_fit > 0:
+            from scipy import stats
+
+            f_statistic = (ss_lack_of_fit / df_lack_of_fit) / (ss_pure_error / df_pure_error)
+            p_value = float(stats.f.sf(f_statistic, df_lack_of_fit, df_pure_error))
+        else:
+            f_statistic = float("nan")
+            p_value = float("nan")
+        lack_of_fit = {
+            "ss_pure_error": ss_pure_error,
+            "ss_lack_of_fit": ss_lack_of_fit,
+            "df_pure_error": df_pure_error,
+            "df_lack_of_fit": df_lack_of_fit,
+            "f_statistic": f_statistic,
+            "p_value": p_value,
+            "significant_lack_of_fit": bool(pd.notna(p_value) and p_value < 0.05),
+        }
+
+    coefficients = {name: float(value) for name, value in zip(term_names, coefficients_array)}
+
+    coefficient_significance: dict[str, dict[str, float]] = {}
+    if df_residual > 0:
+        from scipy import stats
+
+        mse = ss_residual / df_residual
+        xtx_inv = np.linalg.inv(X.T @ X)
+        standard_errors = np.sqrt(np.clip(mse * np.diag(xtx_inv), 0.0, None))
+        for name, coefficient, se in zip(term_names, coefficients_array, standard_errors):
+            if se > 0:
+                t_statistic = float(coefficient / se)
+                p_value = float(2.0 * stats.t.sf(abs(t_statistic), df_residual))
+            else:
+                t_statistic = float("nan")
+                p_value = float("nan")
+            coefficient_significance[name] = {
+                "se": float(se),
+                "t_statistic": t_statistic,
+                "p_value": p_value,
+                "significant": bool(pd.notna(p_value) and p_value < 0.05),
+            }
+
+    grids = [np.linspace(float(rows[variable].min()), float(rows[variable].max()), grid_resolution) for variable in active_variables]
+    mesh = np.meshgrid(*grids, indexing="ij") if len(grids) > 1 else [grids[0]]
+    flat_columns = [component.ravel() for component in mesh]
+    grid_points = pd.DataFrame({variable: flat_columns[index] for index, variable in enumerate(active_variables)})
+    grid_X, _ = _response_surface_design_matrix(grid_points, active_variables)
+    predicted_grid = grid_X @ coefficients_array
+    best_index = int(np.argmax(predicted_grid))
+    optimum = {variable: float(flat_columns[index][best_index]) for index, variable in enumerate(active_variables)}
+
+    return ResponseSurfaceFit(
+        active_variables=list(active_variables),
+        term_names=term_names,
+        coefficients=coefficients,
+        coefficient_significance=coefficient_significance,
+        r_squared=float(r_squared),
+        n_points=n_points,
+        n_params=n_params,
+        lack_of_fit=lack_of_fit,
+        optimum=optimum,
+        predicted_optimum=float(predicted_grid[best_index]),
+    )
+
+
+def analyze_interval_interaction(
+    round2_df: pd.DataFrame,
+    round1_df: pd.DataFrame,
+    baseline: dict[str, float],
+    interaction_variable: str,
+    extra_interval_level: float,
+    interaction_levels: list[float] | None = None,
+    target_col: str = TARGET_COL,
+    tol: float = 1e-6,
+) -> dict[str, Any]:
+    """Compares generate_round2_extension_design's "interval_interaction"
+    block (extra_interval_level x interaction_variable at 2 levels) against
+    round 1's matching OFAT rows for interaction_variable (same 2 levels, at
+    round 1's baseline interval) to answer two questions: (1) does the new
+    interval level change the yield at all, and (2) does that change depend
+    on interaction_variable's level (a real interaction) or is it roughly
+    the same regardless (just a main effect of interval).
+
+    The noise estimate is the "noise_reference" block's own replicate spread
+    at extra_interval_level -- deliberately NOT round 1's baseline noise,
+    since that says nothing about variability in a feed interval nobody had
+    tried before this round. Any of the returned "*_significant" fields is
+    None (not False) when there isn't enough data to judge -- e.g. a missing
+    backfilled result, or n_noise_reference was 0/1 when the design was
+    generated -- so "not enough data" is never silently read as "no effect".
+    """
+
+    interaction_levels = (
+        list(interaction_levels) if interaction_levels is not None else list(CONTINUOUS_BOUNDS[interaction_variable])
+    )
+    if len(interaction_levels) != 2:
+        raise ValueError("analyze_interval_interaction compares exactly 2 interaction_variable levels")
+    low_level, high_level = sorted(interaction_levels)
+
+    def _lookup(rows: pd.DataFrame, level: float) -> float | None:
+        matches = rows[rows[interaction_variable].apply(lambda value: _is_close(value, level, tol))]
+        if matches.empty or pd.isna(matches.iloc[0][target_col]):
+            return None
+        return float(matches.iloc[0][target_col])
+
+    new_rows = round2_df[
+        (round2_df["run_type"] == "interval_interaction")
+        & round2_df["interval_h"].apply(lambda value: _is_close(value, extra_interval_level, tol))
+    ]
+    new_low = _lookup(new_rows, low_level)
+    new_high = _lookup(new_rows, high_level)
+
+    old_rows = _levels_for(interaction_variable, round1_df, baseline, ALL_VARIABLES, tol)
+    old_low = _lookup(old_rows, low_level)
+    old_high = _lookup(old_rows, high_level)
+
+    noise_rows = round2_df[
+        (round2_df["run_type"] == "noise_reference")
+        & round2_df["interval_h"].apply(lambda value: _is_close(value, extra_interval_level, tol))
+    ]
+    noise_values = noise_rows[target_col].dropna().to_numpy(dtype=float)
+    noise_sd = float(np.std(noise_values, ddof=1)) if len(noise_values) >= 2 else None
+    threshold = 2.0 * noise_sd if noise_sd is not None else None
+
+    effect_at_low = new_low - old_low if new_low is not None and old_low is not None else None
+    effect_at_high = new_high - old_high if new_high is not None and old_high is not None else None
+    interaction_effect = (
+        effect_at_high - effect_at_low if effect_at_low is not None and effect_at_high is not None else None
+    )
+
+    def _significant(value: float | None) -> bool | None:
+        if value is None or threshold is None:
+            return None
+        return abs(value) > threshold
+
+    return {
+        "extra_interval_level": extra_interval_level,
+        "interaction_variable": interaction_variable,
+        "low_level": low_level,
+        "high_level": high_level,
+        "effect_at_low": effect_at_low,
+        "effect_at_high": effect_at_high,
+        "interaction_effect": interaction_effect,
+        "noise_sd": noise_sd,
+        "noise_n": int(len(noise_values)),
+        "threshold": threshold,
+        "interval_effect_significant_at_low": _significant(effect_at_low),
+        "interval_effect_significant_at_high": _significant(effect_at_high),
+        "interaction_significant": _significant(interaction_effect),
+    }
+
+
+def evaluate_response_surface(fit: ResponseSurfaceFit, df: pd.DataFrame) -> np.ndarray:
+    """Predicted target values for arbitrary rows, reusing fit's already-fit
+    coefficients (not a refit). The two consumers are both diagnostic, not
+    analytical: residual plots (predicted vs actual on the fitted points
+    themselves) and response_surface_grid's contour slices."""
+    X, term_names = _response_surface_design_matrix(df, fit.active_variables)
+    coefficients_array = np.array([fit.coefficients[name] for name in term_names])
+    return X @ coefficients_array
+
+
+def response_surface_grid(
+    fit: ResponseSurfaceFit,
+    df: pd.DataFrame,
+    x_variable: str,
+    y_variable: str,
+    fixed_at: dict[str, float] | None = None,
+    resolution: int = 41,
+) -> dict[str, Any]:
+    """2D prediction grid for x_variable/y_variable, each spanning its own
+    *tested* range within df (same reasoning as fit_ccd_response_surface's
+    optimum search -- no extrapolating past what was actually measured),
+    with every other active variable held at fixed_at (defaults to the
+    fitted optimum's value for that variable). This is the standard
+    CCD contour-plot slice: what the surface looks like across two
+    variables at a time, with the rest pinned at a sensible point.
+    """
+    if x_variable not in fit.active_variables or y_variable not in fit.active_variables:
+        raise ValueError("x_variable/y_variable must both be in fit.active_variables")
+
+    fixed_at = dict(fixed_at) if fixed_at is not None else {}
+    other_variables = [variable for variable in fit.active_variables if variable not in (x_variable, y_variable)]
+    for variable in other_variables:
+        fixed_at.setdefault(variable, fit.optimum[variable])
+
+    x_values = np.linspace(float(df[x_variable].min()), float(df[x_variable].max()), resolution)
+    y_values = np.linspace(float(df[y_variable].min()), float(df[y_variable].max()), resolution)
+    mesh_x, mesh_y = np.meshgrid(x_values, y_values)
+    grid_points = pd.DataFrame({x_variable: mesh_x.ravel(), y_variable: mesh_y.ravel()})
+    for variable in other_variables:
+        grid_points[variable] = fixed_at[variable]
+    predicted = evaluate_response_surface(fit, grid_points).reshape(mesh_x.shape)
+
+    return {
+        "x_variable": x_variable,
+        "y_variable": y_variable,
+        "x_values": x_values,
+        "y_values": y_values,
+        "z": predicted,
+        "fixed_at": fixed_at,
+    }
+
+
+@dataclass(frozen=True)
+class ResponseSurfaceVerdict:
+    severity: str  # "success" | "info" | "warning"
+    message: str
+
+
+def summarize_response_surface(
+    fit: ResponseSurfaceFit,
+    df: pd.DataFrame,
+    od_fit: ResponseSurfaceFit | None = None,
+    od_threshold: float | None = None,
+    boundary_tol: float = 0.02,
+) -> list[ResponseSurfaceVerdict]:
+    """Turns fit_ccd_response_surface's (and optionally an OD600 fit's)
+    already-computed numbers into the plain-language read a domain-competent
+    reviewer would do by hand, ending in one concrete next step -- R^2 and a
+    lack-of-fit p-value on their own don't say what to actually do next, and
+    without this function that reading only exists in whoever looks at the
+    numbers that particular day.
+
+    df must be the same rows fit was built from (only used here to read each
+    active variable's tested min/max, to check whether the optimum landed on
+    the edge of what was actually tested).
+    """
+
+    verdicts: list[ResponseSurfaceVerdict] = []
+
+    if fit.r_squared >= 0.9:
+        verdicts.append(ResponseSurfaceVerdict("success", f"拟合优度很高（R²={fit.r_squared:.3g}），二次模型能很好地描述这批数据。"))
+    elif fit.r_squared >= 0.7:
+        verdicts.append(ResponseSurfaceVerdict("info", f"拟合优度中等（R²={fit.r_squared:.3g}），二次模型大致能描述趋势，但还有一部分变化解释不了。"))
+    else:
+        verdicts.append(ResponseSurfaceVerdict("warning", f"拟合优度偏低（R²={fit.r_squared:.3g}），二次模型可能不足以描述这批数据，后面的结论要谨慎看待。"))
+
+    lack_of_fit_bad = False
+    if fit.lack_of_fit is None:
+        verdicts.append(ResponseSurfaceVerdict("info", "样本不足以做失拟检验，模型形式对不对暂时无法判断。"))
+    elif fit.lack_of_fit["significant_lack_of_fit"]:
+        lack_of_fit_bad = True
+        verdicts.append(
+            ResponseSurfaceVerdict(
+                "warning",
+                f"存在显著失拟（p={fit.lack_of_fit['p_value']:.3g}）：真实响应面可能不是简单的二次曲面"
+                "（比如有更高阶弯曲，或者漏看了某个变量/交互），预测最优点只能当参考，不能直接当结论。",
+            )
+        )
+    else:
+        verdicts.append(ResponseSurfaceVerdict("success", "未见显著失拟：目前数据不能拒绝「二次模型合适」这个假设。"))
+
+    for variable in fit.active_variables:
+        quad_stats = fit.coefficient_significance.get(f"{variable}^2")
+        linear_stats = fit.coefficient_significance.get(variable)
+        quad_coef = fit.coefficients.get(f"{variable}^2", 0.0)
+        if quad_stats and quad_stats["significant"]:
+            shape = "峰值曲率（存在真实的转折/封顶）" if quad_coef < 0 else "谷值曲率（如果目标是最大化产量，最优可能在边界而不是中间）"
+            verdicts.append(ResponseSurfaceVerdict("info", f"「{variable}」呈现{shape}。"))
+        elif linear_stats and linear_stats["significant"]:
+            verdicts.append(ResponseSurfaceVerdict("info", f"「{variable}」在测试范围内大致是单调趋势，暂时没看到弯曲/封顶的迹象。"))
+
+    any_boundary = False
+    for variable in fit.active_variables:
+        lower = float(df[variable].min())
+        upper = float(df[variable].max())
+        span = upper - lower
+        if span <= 0:
+            continue
+        value = fit.optimum[variable]
+        if (value - lower) / span < boundary_tol:
+            any_boundary = True
+            verdicts.append(
+                ResponseSurfaceVerdict(
+                    "warning",
+                    f"「{variable}」的联合最优点贴着本轮测试范围下限（{lower:g}），实际最优可能在范围之外，"
+                    "建议下一轮往更低的方向扩大范围，而不是直接验证当前点。",
+                )
+            )
+        elif (upper - value) / span < boundary_tol:
+            any_boundary = True
+            verdicts.append(
+                ResponseSurfaceVerdict(
+                    "warning",
+                    f"「{variable}」的联合最优点贴着本轮测试范围上限（{upper:g}），实际最优可能在范围之外，"
+                    "建议下一轮往更高的方向扩大范围，而不是直接验证当前点。",
+                )
+            )
+
+    od_feasible: bool | None = None
+    if od_fit is not None and od_threshold is not None:
+        predicted_od = float(evaluate_response_surface(od_fit, pd.DataFrame([fit.optimum]))[0])
+        od_feasible = predicted_od >= od_threshold
+        if not od_feasible:
+            verdicts.append(
+                ResponseSurfaceVerdict(
+                    "warning",
+                    f"产量最优点的预测 OD600（{predicted_od:.3g}）低于可行阈值（{od_threshold:.3g}）："
+                    "这个点按产量看最优，但按生长可行性看不成立，不能直接当作推荐条件。",
+                )
+            )
+
+    if lack_of_fit_bad:
+        next_step = "先不要用这个模型的最优点做决策：建议重新检查是否漏看了变量/交互，或尝试更高阶的模型，而不是直接推进到验证实验。"
+        severity = "warning"
+    elif any_boundary:
+        next_step = "建议先扩大测试范围，而不是直接安排验证批次——当前最优点很可能不是真正的最优，只是测试范围的边缘。"
+        severity = "warning"
+    elif od_feasible is False:
+        next_step = "建议在产量和 OD600 可行性之间找折中点（参考「合并数据后的贝叶斯优化建议」），不要直接采用这个纯产量最优点。"
+        severity = "warning"
+    else:
+        next_step = "模型和数据一致、最优点在测试范围内部且（若已检验）可行：建议安排 1-2 个验证批次，实测这个预测最优点附近的条件，确认与模型预测一致后再定为下一轮基准。"
+        severity = "success"
+    verdicts.append(ResponseSurfaceVerdict(severity, f"下一步建议：{next_step}"))
+
+    return verdicts
