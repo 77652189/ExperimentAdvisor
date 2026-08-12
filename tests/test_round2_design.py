@@ -930,6 +930,13 @@ def test_sensitivity_analysis_plateau_matches_analytic_width_for_k1():
     assert ph_result.touches_lower_bound is False
     assert ph_result.touches_upper_bound is False
     assert ph_result.plateau_width_fraction == pytest.approx(0.5, abs=0.02)  # 0.5-wide plateau / 1.0-wide tested range
+    # the exposed sweep arrays must be internally consistent with the
+    # already-reported peak/plateau numbers, not an independent recompute
+    # a caller could plot something different from what the bounds describe.
+    assert len(ph_result.x_values) == len(ph_result.predicted) == 401
+    peak_index = int(np.argmax(ph_result.predicted))
+    assert ph_result.x_values[peak_index] == pytest.approx(ph_result.peak_x)
+    assert ph_result.predicted[peak_index] == pytest.approx(ph_result.peak_value)
 
 
 def test_sensitivity_analysis_flags_plateau_touching_tested_range_edge():
@@ -1052,6 +1059,11 @@ def test_optimize_joint_desirability_finds_a_compromise_when_yield_optimum_is_in
     assert result.composite_desirability == pytest.approx(
         (result.yield_desirability * result.od_desirability) ** 0.5
     )
+    # pure_yield_optimum_od600 must match od_fit evaluated directly at
+    # fit.optimum (already computed above as at_yield_optimum) -- it exists
+    # specifically to show how infeasible the pure-yield answer actually is
+    # on a yield-vs-OD600 trade-off plot, not a rounded or re-derived number.
+    assert result.pure_yield_optimum_od600 == pytest.approx(at_yield_optimum)
 
 
 def test_optimize_joint_desirability_matches_pure_yield_optimum_when_already_feasible():

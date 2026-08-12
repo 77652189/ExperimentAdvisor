@@ -1481,6 +1481,44 @@ def _pichia_sensitivity_table(sensitivity: dict[str, Any]) -> pd.DataFrame:
         )
     return pd.DataFrame(rows)
 
+def _pichia_sensitivity_chart(result: Any, variable_label: str) -> go.Figure:
+    """The sweep sensitivity_analysis's own plateau bounds were read off of,
+    made visible: the shaded band is the "容许范围" from the table, the
+    dashed line is the 95%-of-peak cutoff that band was measured against."""
+    cutoff = result.peak_value - abs(result.peak_value) * 0.05
+    fig = go.Figure()
+    fig.add_vrect(x0=result.plateau_low, x1=result.plateau_high, fillcolor=PICHIA_ACCENT_COLOR, opacity=0.15, line_width=0)
+    fig.add_trace(
+        go.Scatter(
+            x=[result.tested_low, result.tested_high],
+            y=[cutoff, cutoff],
+            mode="lines",
+            line=dict(color=PICHIA_MUTED_COLOR, dash="dash"),
+            name="峰值的95%",
+            hoverinfo="skip",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(x=result.x_values, y=result.predicted, mode="lines", line=dict(color=PICHIA_ACCENT_COLOR, width=2), name="预测产量")
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[result.peak_x], y=[result.peak_value], mode="markers", marker=dict(color="#e66767", size=10, symbol="star"), name="峰值点"
+        )
+    )
+    fig.update_layout(
+        title=f"{variable_label}：灵敏度扫描（阴影=容许范围）",
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis_title=variable_label,
+        yaxis_title="预测产量",
+        showlegend=False,
+        margin=dict(t=50, b=40, l=60, r=30),
+        height=300,
+    )
+    return fig
+
 _PICHIA_CANONICAL_LABELS: dict[str, str] = {
     "maximum": "真极大值（有明确的单一峰值）",
     "minimum": "真极小值（有明确的单一谷值——如果目标是最大化产量，这个方向不是好消息）",
@@ -1513,11 +1551,42 @@ def _pichia_canonical_table(canonical: Any) -> pd.DataFrame:
     }
     return pd.DataFrame([row])
 
+def _pichia_canonical_eigenvalue_chart(canonical: Any, ridge_tolerance: float = 0.05) -> go.Figure:
+    """The raw evidence the max/min/saddle/ridge classification in the table
+    above is actually computed from -- otherwise the classification is just
+    an assertion to take on faith. Bars inside the shaded band are the
+    "no real curvature in this direction" eigenvalues (see canonical_analysis's
+    own ridge_tolerance); a ridge/saddle classification is one bar in that
+    band (or of the opposite sign from the rest) away from being a clean
+    maximum/minimum."""
+    values = canonical.eigenvalues
+    scale = max((abs(v) for v in values), default=0.0)
+    threshold = ridge_tolerance * scale
+    if len(canonical.active_variables) == 1:
+        labels = [PICHIA_VARIABLE_LABELS.get(canonical.active_variables[0], canonical.active_variables[0])]
+    else:
+        labels = [f"曲率方向 {index + 1}" for index in range(len(values))]
+    colors = [PICHIA_MUTED_COLOR if abs(value) < threshold else ("#e66767" if value < 0 else PICHIA_ACCENT_COLOR) for value in values]
+    fig = go.Figure(go.Bar(x=labels, y=values, marker_color=colors, hovertemplate="%{x}<br>特征值: %{y:.4g}<extra></extra>"))
+    fig.add_hline(y=0, line=dict(color=PICHIA_MUTED_COLOR, width=1))
+    if scale > 0:
+        fig.add_hrect(y0=-threshold, y1=threshold, fillcolor=PICHIA_MUTED_COLOR, opacity=0.15, line_width=0)
+    fig.update_layout(
+        title="曲率特征值（灰色带内视为「没有真实曲率」）",
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        yaxis_title="特征值",
+        margin=dict(t=50, b=40, l=60, r=30),
+        height=280,
+    )
+    return fig
+
 PICHIA_DESIRABILITY_HELP: dict[str, str] = {
     "方案": "两个候选点的对比：只看产量能拿到多少，vs. 同时兼顾产量和 OD600 可行性能拿到多少。",
     "预测产量": "该点代入产量响应面拟合算出的预测产量。",
-    "预测OD600": "该点代入 OD600 响应面拟合算出的预测生长量；纯产量最优点这一行留空，因为选它时完全没考虑 OD600。",
-    "满意度(0~1)": "Derringer-Suich 满意度：产量和 OD600 可行性各自打 0~1 分后取几何平均——只要有一项是 0（例如 OD600 完全不可行），总分就是 0，不会被另一项的高分「平均」掉。",
+    "预测OD600": "该点代入 OD600 响应面拟合算出的预测生长量——纯产量最优点这一行也算了这个值，用来说明选它到底在 OD600 上差多远，不是完全没有这个信息。",
+    "满意度(0~1)": "Derringer-Suich 满意度：产量和 OD600 可行性各自打 0~1 分后取几何平均——只要有一项是 0（例如 OD600 完全不可行），总分就是 0，不会被另一项的高分「平均」掉。纯产量最优点这一行留空，因为选它时完全没考虑 OD600，谈不上一个联合满意度分数。",
 }
 
 def _pichia_desirability_table(result: Any) -> pd.DataFrame:
@@ -1538,7 +1607,13 @@ def _pichia_desirability_table(result: Any) -> pd.DataFrame:
         return row
 
     rows = [
-        _row("纯产量最优点（不考虑OD600）", result.pure_yield_optimum, result.pure_yield_optimum_value, None, None),
+        _row(
+            "纯产量最优点（不考虑OD600）",
+            result.pure_yield_optimum,
+            result.pure_yield_optimum_value,
+            result.pure_yield_optimum_od600,
+            None,
+        ),
         _row("联合满意度最优点", result.point, result.predicted_yield, result.predicted_od600, result.composite_desirability),
     ]
     return pd.DataFrame(rows)
@@ -1549,6 +1624,46 @@ def _pichia_desirability_column_config(result: Any) -> dict[str, Any]:
         label = PICHIA_VARIABLE_LABELS.get(name, name)
         config.setdefault(label, f"「{label}」在该方案下的取值。")
     return {column: st.column_config.Column(help=text) for column, text in config.items()}
+
+def _pichia_desirability_tradeoff_chart(result: Any, od_threshold: float) -> go.Figure:
+    """Yield-vs-OD600 scatter comparing the two candidate points -- they sit
+    at different process conditions, but what the trade-off is actually
+    about is where each one lands on these two axes, not which conditions
+    produced them (already shown in the table)."""
+    fig = go.Figure()
+    fig.add_vline(line=dict(color=PICHIA_MUTED_COLOR, dash="dash"), x=od_threshold)
+    fig.add_annotation(x=od_threshold, y=1.02, yref="paper", text="OD600 可行阈值", showarrow=False, font=dict(color=PICHIA_MUTED_COLOR, size=11))
+    fig.add_trace(
+        go.Scatter(
+            x=[result.pure_yield_optimum_od600],
+            y=[result.pure_yield_optimum_value],
+            mode="markers",
+            marker=dict(color="#e6e4da", size=13, symbol="circle"),
+            name="纯产量最优点",
+            hovertemplate="纯产量最优点<br>预测产量: %{y:.4g}<br>预测OD600: %{x:.3g}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[result.predicted_od600],
+            y=[result.predicted_yield],
+            mode="markers",
+            marker=dict(color="#e66767", size=13, symbol="diamond"),
+            name="联合满意度最优点",
+            hovertemplate="联合满意度最优点<br>预测产量: %{y:.4g}<br>预测OD600: %{x:.3g}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title="产量 vs OD600 权衡",
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis_title="预测 OD600",
+        yaxis_title="预测产量",
+        margin=dict(t=50, b=40, l=60, r=30),
+        height=340,
+    )
+    return fig
 
 def _pichia_render_response_surface_deep_dive(
     fit: Any,
@@ -1583,6 +1698,12 @@ def _pichia_render_response_surface_deep_dive(
         )
         if case == "boundary" and any(result.touches_lower_bound or result.touches_upper_bound for result in sensitivity.values()):
             st.caption("留意「触及测试范围边界」为「是」的行——这些变量的真实容许范围可能比表里算出的更宽，只是被本轮测试范围卡住了。")
+        sensitivity_cols = st.columns(2)
+        for index, (variable, result) in enumerate(sensitivity.items()):
+            with sensitivity_cols[index % 2]:
+                st.plotly_chart(
+                    _pichia_sensitivity_chart(result, PICHIA_VARIABLE_LABELS.get(variable, variable)), width="stretch"
+                )
 
     with st.expander("鞍点/岭线判别（曲面到底是不是真的有峰）", expanded=(case == "boundary")):
         st.caption("经典响应面 canonical analysis：抛开网格搜索给出的「测试范围内最好的点」，只看拟合公式本身的曲率，判断曲面真实的形状。")
@@ -1593,6 +1714,7 @@ def _pichia_render_response_surface_deep_dive(
             hide_index=True,
             column_config={column: st.column_config.Column(help=text) for column, text in PICHIA_CANONICAL_HELP.items()},
         )
+        st.plotly_chart(_pichia_canonical_eigenvalue_chart(canonical), width="stretch")
         if case == "boundary":
             if canonical.classification in ("ridge", "flat"):
                 st.info(
@@ -1617,6 +1739,7 @@ def _pichia_render_response_surface_deep_dive(
                 hide_index=True,
                 column_config=_pichia_desirability_column_config(desirability),
             )
+            st.plotly_chart(_pichia_desirability_tradeoff_chart(desirability, od_threshold), width="stretch")
             if case == "od_infeasible":
                 yield_cost = (
                     1.0 - desirability.predicted_yield / desirability.pure_yield_optimum_value

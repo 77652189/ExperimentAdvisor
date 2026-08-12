@@ -1423,6 +1423,8 @@ class SensitivityResult:
     plateau_width_fraction: float  # plateau_width / (tested_high - tested_low)
     touches_lower_bound: bool
     touches_upper_bound: bool
+    x_values: np.ndarray  # the swept grid itself, so a caller can plot the curve
+    predicted: np.ndarray  # the plateau bounds were read off of, not just report them
 
 
 def sensitivity_analysis(
@@ -1477,6 +1479,8 @@ def sensitivity_analysis(
             plateau_width_fraction=(float(x_values[high_index] - x_values[low_index]) / span) if span > 0 else float("nan"),
             touches_lower_bound=low_index == 0,
             touches_upper_bound=high_index == resolution - 1,
+            x_values=x_values,
+            predicted=predicted,
         )
     return results
 
@@ -1598,6 +1602,7 @@ class DesirabilityResult:
     od_high: float
     pure_yield_optimum: dict[str, float]
     pure_yield_optimum_value: float
+    pure_yield_optimum_od600: float  # od_fit's prediction AT fit.optimum -- quantifies exactly how infeasible (or not) the pure-yield answer is, for a yield-vs-OD600 trade-off plot
 
 
 def optimize_joint_desirability(
@@ -1644,6 +1649,7 @@ def optimize_joint_desirability(
 
     best_index = int(np.argmax(composite))
     point = {variable: float(flat_columns[index][best_index]) for index, variable in enumerate(fit.active_variables)}
+    pure_yield_optimum_od600 = float(evaluate_response_surface(od_fit, pd.DataFrame([fit.optimum]))[0])
 
     return DesirabilityResult(
         point=point,
@@ -1658,6 +1664,7 @@ def optimize_joint_desirability(
         od_high=od_threshold,
         pure_yield_optimum=dict(fit.optimum),
         pure_yield_optimum_value=fit.predicted_optimum,
+        pure_yield_optimum_od600=pure_yield_optimum_od600,
     )
 
 
