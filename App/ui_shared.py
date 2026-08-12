@@ -15,12 +15,13 @@ UI_CACHE_VERSION = "ui-cache-v1"
 
 PICHIA_UI_CACHE_KEYS = {
     "recommendation_mode",
-    "round2_bo_batch_size",
     "round2_max_active_variables",
     "round2_ccd_step_fraction",
     "round2_od_threshold_fraction",
-    "pichia_ui_design_records",
 }
+# "round2_bo_batch_size" and "pichia_ui_design_records" used to be listed here;
+# both belonged to the Round1-only BO batch and the history tab that ADR-0016
+# deleted, so nothing writes them any more and caching them cached nothing.
 
 PICHIA_UI_CACHE_PREFIXES: tuple[str, ...] = ()
 # Note: round1_builder_* widget keys deliberately are NOT in the cross-session

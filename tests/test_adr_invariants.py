@@ -56,6 +56,6 @@ def test_adr_0008_ofat_levels_are_user_extensible_in_ui():
     """ADR-0008: Round 1 builder UI must let users add OFAT levels beyond the
     protocol defaults, not just render fixed checkboxes.
     """
-    path = REPO_ROOT / "App" / "pages_pichia.py"
+    path = REPO_ROOT / "App" / "pichia_round1.py"
     text = path.read_text(encoding="utf-8")
     assert "增加新水平" in text

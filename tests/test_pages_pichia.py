@@ -1,4 +1,4 @@
-"""Guards for the Round 1 result-upload remapping in App/pages_pichia.py.
+"""Guards for the Round 1 result-upload remapping in App/pichia_results_io.py.
 
 Covers real-world variations seen in returned lab data (2026-08 Y103 round 1)
 that the original exact-header-match remap didn't handle: a unit-annotated
@@ -14,15 +14,17 @@ import pandas as pd
 import pytest
 import streamlit as st
 
-from App.pages_pichia import (
+from App.pichia_common import (
     PICHIA_OD_COL,
     PICHIA_TARGET_COL,
-    _pichia_bo_cv_training_rows,
+    _pichia_restore_persisted_dataset,
+)
+from App.pichia_results_io import (
     _pichia_pooled_technical_noise,
     _pichia_remap_uploaded_columns,
-    _pichia_restore_persisted_dataset,
-    _pichia_simulate_round2_results,
 )
+from App.pichia_round2_bo_views import _pichia_bo_cv_training_rows
+from App.pichia_round2_sections import _pichia_simulate_round2_results
 
 
 def _row(run_id: str = "R1-01", yield_value=13.0, yield_header: str = "hLF产量（mg/L）(待填)", **extra) -> dict:
