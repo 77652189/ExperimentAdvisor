@@ -118,6 +118,71 @@ def _pichia_effect_magnitude_chart(effects: dict[str, FactorEffect], threshold: 
     )
     return fig
 
+def _pichia_round2_significance_section(plan: Round2Plan, run_df: pd.DataFrame) -> None:
+    """Which round 1 variables earned a place in the Round 2 design, and on what
+    evidence: the baseline noise the significance threshold is derived from, the
+    technical-replicate noise that deliberately stays out of that threshold (see
+    ADR-0011), the effect sizes themselves, and the additivity check on whatever
+    joint-exploration points round 1 happened to include."""
+    st.markdown("#### 噪声与显著性阈值")
+    noise = plan.noise
+    cols = st.columns(3)
+    cols[0].metric("基线重复数", noise["n_replicates"])
+    cols[1].metric("基线均值", _num(noise["baseline_mean"]))
+    cols[2].metric("显著性阈值", _num(noise["threshold"]))
+
+    technical_noise = _pichia_pooled_technical_noise(run_df)
+    if technical_noise:
+        st.caption(
+            f"另一种噪声：同一样本测 2 次（技术重复）的差异。汇总全部 {technical_noise['n_runs']} 个有重复的编号后，"
+            f"技术重复噪声(SD)≈{_num(technical_noise['pooled_sd'])}（自由度 {technical_noise['dof']}，"
+            f"比上面基线批次噪声的自由度 {noise['n_replicates'] - 1} 高很多，估得更稳）。"
+            "有意不并入上面的显著性阈值：每个 round 1 样本统一测 2 次技术重复，"
+            "批次噪声本身已经是「run 间会差多少」的正确尺度；这里只作为独立的数据质量参考——"
+            "谁的技术重复差异远超其他编号（下面会标出来），值得单独复核，但不改变谁进入响应面设计。"
+        )
+        if technical_noise["outliers"]:
+            outlier_text = "、".join(f"{run_id}(SD≈{_num(sd)})" for run_id, sd in technical_noise["outliers"])
+            st.warning(f"这些编号的技术重复差异明显超过其余编号的普遍水平（>2x 汇总 SD）：{outlier_text}，建议重点核实。")
+
+    st.markdown("#### 固定变量（不显著，或离散档位已测完）")
+    fixed_rows = [
+        {"变量": PICHIA_VARIABLE_LABELS.get(name, name), "固定取值": _num(value)}
+        for name, value in plan.fixed_values.items()
+    ]
+    st.dataframe(pd.DataFrame(fixed_rows), width="stretch", hide_index=True)
+
+    st.markdown("#### 活跃变量（进入响应面设计）")
+    st.metric("活跃变量数 (K)", len(plan.active_variables))
+    st.plotly_chart(
+        _pichia_effect_magnitude_chart(plan.effects, noise["threshold"]),
+        width="stretch",
+    )
+    if not plan.active_variables:
+        st.info("当前数据下没有变量的效应大到需要响应面细化；可以直接看「④ 合并数据贝叶斯优化」子页的建议，或考虑扩大探索范围重新走一轮。")
+    for variable, note in plan.untested_notes.items():
+        st.warning(f"⚠️ 「{PICHIA_VARIABLE_LABELS.get(variable, variable)}」本轮未测，不是「测过发现不显著」：{note}")
+    for variable, note in plan.boundary_notes.items():
+        st.warning(f"{PICHIA_VARIABLE_LABELS.get(variable, variable)}：{note}")
+    for variable, note in plan.overflow_notes.items():
+        st.info(f"{PICHIA_VARIABLE_LABELS.get(variable, variable)}：{note}")
+
+    if plan.combo_interactions:
+        st.markdown("#### 联合探索点的可加性检查")
+        st.caption("检查每个联合探索样本的实测值和「按单变量效应线性叠加」的预测值之间的差距；差距超过阈值提示可能存在变量间交互。")
+        interaction_rows = [
+            {
+                "样本": item["row_id"],
+                "改变的变量": "、".join(PICHIA_VARIABLE_LABELS.get(name, name) for name in item["changed_variables"]),
+                "实测": _num(item["observed"]),
+                "可加性预测": _num(item["additive_prediction"]),
+                "残差": _num(item["residual"]),
+                "可能存在交互": "是" if item["possible_interaction"] else "否",
+            }
+            for item in plan.combo_interactions
+        ]
+        st.dataframe(pd.DataFrame(interaction_rows), width="stretch", hide_index=True)
+
 def _pichia_simulate_round2_results(design: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
     """Fills currently-blank yield/od600 cells with deterministic, plausible
     (not random-garbage) synthetic values -- same formula and seed used to
@@ -164,6 +229,17 @@ def _pichia_round2_design_and_backfill_section(plan: Round2Plan, round1_df: pd.D
     the combined sheet the same download / upload-backfill / save-to-final
     loop Round 1's design has, so results collected under it are reproducible
     and don't dead-end in a chat transcript."""
+    if plan.active_variables:
+        st.markdown("#### Round 2 响应面设计（Face-centered CCD）")
+        ccd_rows = []
+        for row in plan.design_rows:
+            display = _pichia_variable_display(row)
+            display["复用 Round1 样本"] = row.get("reused_from_round1") or ""
+            ccd_rows.append(display)
+        st.dataframe(pd.DataFrame(ccd_rows), width="stretch", hide_index=True)
+        reused_count = sum(1 for row in plan.design_rows if row.get("reused_from_round1"))
+        st.caption(f"共 {len(plan.design_rows)} 个设计点，其中 {reused_count} 个和 Round 1 已有数据重合，可以直接复用、不用重新做。")
+
     _ensure_pichia_data_area()
     if _pichia_restore_persisted_dataset("round2_full_design_df", PICHIA_ROUND2_DATASET_PATH):
         st.toast(f"已从 {PICHIA_ROUND2_DATASET_PATH.name} 恢复上次保存的 Round 2 结果。", icon="✅")
@@ -319,25 +395,46 @@ def _pichia_round2_design_and_backfill_section(plan: Round2Plan, round1_df: pd.D
         edited.to_csv(PICHIA_ROUND2_DATASET_PATH, index=False, encoding="utf-8-sig")
         st.success(f"已保存到 {PICHIA_ROUND2_DATASET_PATH}")
 
-def _pichia_round2_results_analysis_section(plan: Round2Plan, round1_df: pd.DataFrame) -> None:
-    """What becomes analyzable once the Round 2 sheet above is actually
-    backfilled -- generating that sheet only produces conditions to test, not
-    conclusions, and without this section there is nowhere the CCD block's
-    fitted response surface, the interval-interaction verdict, or a BO
-    recommendation informed by the combined dataset would ever show up."""
+PICHIA_ROUND2_NO_RESULTS_HINT = (
+    "还没有可分析的 Round 2 结果。先在「② 设计生成与回填」子页生成设计表，"
+    "再把产量和 OD600 填回去——只有两个都填了的行才会进入分析。"
+)
+
+def _pichia_round2_filled_design() -> pd.DataFrame | None:
+    """The Round 2 rows that are actually analyzable: both yield and OD600
+    present. None when the sheet doesn't exist yet or nothing is backfilled.
+
+    Lives here rather than as two early returns inside the response-surface and
+    BO sections because both need the same view of the same sheet, and after the
+    split into sub-tabs both also need to *say* something when it's empty --
+    a silently blank sub-tab reads as a broken page, not as "no data yet"."""
     full_design = st.session_state.get("round2_full_design_df")
     if full_design is None or full_design.empty:
-        return
+        return None
     numeric_full = _pichia_numeric_results(full_design)
     filled_mask = numeric_full[[PICHIA_TARGET_COL, PICHIA_OD_COL]].notna().all(axis=1)
     if not filled_mask.any():
-        return
+        return None
+    return numeric_full.loc[filled_mask]
 
-    st.markdown("#### Round 2 结果分析")
-    filled_design = numeric_full.loc[filled_mask]
+def _pichia_round2_surface_section(plan: Round2Plan, round1_df: pd.DataFrame) -> None:
+    """What this round's own designed points say: the fitted response surface
+    over the CCD block (plus the deep-dive reads of it) and the feed-interval
+    interaction verdict. Generating the design sheet only produces conditions to
+    test, not conclusions -- this is where the backfilled numbers turn into one.
+
+    Deliberately separate from the combined-dataset BO section: that answers a
+    different question (where to go next given everything measured so far), and
+    keeping them in one sub-tab was most of why the Round 2 page had become an
+    unnavigable scroll."""
+    filled_design = _pichia_round2_filled_design()
+    if filled_design is None:
+        st.info(PICHIA_ROUND2_NO_RESULTS_HINT)
+        return
+    full_design = st.session_state["round2_full_design_df"]
 
     if plan.active_variables:
-        st.markdown("##### 响应面 (CCD) 拟合")
+        st.markdown("#### 响应面 (CCD) 拟合")
         ccd_rows = filled_design[filled_design["run_type"] == "ccd"]
         try:
             fit = fit_ccd_response_surface(ccd_rows, plan.active_variables)
@@ -451,7 +548,7 @@ def _pichia_round2_results_analysis_section(plan: Round2Plan, round1_df: pd.Data
                             width="stretch",
                         )
 
-            st.markdown("##### 深入分析")
+            st.markdown("#### 深入分析")
             case = classify_response_surface_case(
                 fit, ccd_rows, od_fit=od_fit, od_threshold=od_threshold if od_fit is not None else None
             )
@@ -461,7 +558,7 @@ def _pichia_round2_results_analysis_section(plan: Round2Plan, round1_df: pd.Data
 
     interaction_rows = full_design[full_design["run_type"] == "interval_interaction"]
     if not interaction_rows.empty:
-        st.markdown("##### 补料间隔交互检验")
+        st.markdown("#### 补料间隔交互检验")
         interaction_variable = interaction_rows["changed_variable"].iloc[0]
         extra_interval_level = float(interaction_rows["interval_h"].iloc[0])
         interaction_levels = sorted(interaction_rows[interaction_variable].dropna().unique().tolist())
@@ -494,7 +591,16 @@ def _pichia_round2_results_analysis_section(plan: Round2Plan, round1_df: pd.Data
         elif result["interaction_significant"] is False:
             st.caption(f"「补料间隔 {extra_interval_level:g}h」的效应在两个「{label}」水平下差不多，可以当一个不依赖「{label}」的主效应来看。")
 
-    st.markdown("##### 合并数据后的贝叶斯优化建议")
+def _pichia_round2_combined_bo_section(plan: Round2Plan, round1_df: pd.DataFrame) -> None:
+    """Bayesian optimisation over Round 1 + whatever Round 2 is backfilled so
+    far -- the ADR-0009 track that keeps running alongside the response surface
+    instead of competing with it, and the only remaining BO entry after
+    ADR-0016 removed the Round1-only preview."""
+    filled_design = _pichia_round2_filled_design()
+    if filled_design is None:
+        st.info(PICHIA_ROUND2_NO_RESULTS_HINT)
+        return
+
     st.caption("用 Round 1 + 本轮已回填的 Round 2 数据一起重新训练 GP——数据量和覆盖面都比只用 Round 1 时更完整。")
     combined_columns = ["run_id", *PICHIA_VARIABLES, PICHIA_TARGET_COL, PICHIA_OD_COL]
     combined_df = pd.concat(
@@ -588,75 +694,20 @@ def _pichia_round2_tab() -> None:
         st.error(f"Round 2 分析暂时无法运行：{exc}")
         return
 
-    st.markdown("#### 噪声与显著性阈值")
-    noise = plan.noise
-    cols = st.columns(3)
-    cols[0].metric("基线重复数", noise["n_replicates"])
-    cols[1].metric("基线均值", _num(noise["baseline_mean"]))
-    cols[2].metric("显著性阈值", _num(noise["threshold"]))
-
-    technical_noise = _pichia_pooled_technical_noise(run_df)
-    if technical_noise:
-        st.caption(
-            f"另一种噪声：同一样本测 2 次（技术重复）的差异。汇总全部 {technical_noise['n_runs']} 个有重复的编号后，"
-            f"技术重复噪声(SD)≈{_num(technical_noise['pooled_sd'])}（自由度 {technical_noise['dof']}，"
-            f"比上面基线批次噪声的自由度 {noise['n_replicates'] - 1} 高很多，估得更稳）。"
-            "有意不并入上面的显著性阈值：每个 round 1 样本统一测 2 次技术重复，"
-            "批次噪声本身已经是「run 间会差多少」的正确尺度；这里只作为独立的数据质量参考——"
-            "谁的技术重复差异远超其他编号（下面会标出来），值得单独复核，但不改变谁进入响应面设计。"
-        )
-        if technical_noise["outliers"]:
-            outlier_text = "、".join(f"{run_id}(SD≈{_num(sd)})" for run_id, sd in technical_noise["outliers"])
-            st.warning(f"这些编号的技术重复差异明显超过其余编号的普遍水平（>2x 汇总 SD）：{outlier_text}，建议重点核实。")
-
-    st.markdown("#### 固定变量（不显著，或离散档位已测完）")
-    fixed_rows = [
-        {"变量": PICHIA_VARIABLE_LABELS.get(name, name), "固定取值": _num(value)}
-        for name, value in plan.fixed_values.items()
-    ]
-    st.dataframe(pd.DataFrame(fixed_rows), width="stretch", hide_index=True)
-
-    st.markdown("#### 活跃变量（进入响应面设计）")
-    st.metric("活跃变量数 (K)", len(plan.active_variables))
-    st.plotly_chart(
-        _pichia_effect_magnitude_chart(plan.effects, noise["threshold"]),
-        width="stretch",
+    # The four sub-tab bodies all run on every rerun in the order written here
+    # -- st.tabs only hides them visually, it does not defer them. Design and
+    # backfill therefore has to stay above the response-surface and BO tabs:
+    # its st.data_editor is what writes "round2_full_design_df", which those two
+    # then read, and flipping the order would make a freshly typed-in result
+    # need a second interaction before the analysis picked it up.
+    significance_tab, design_tab, surface_tab, bo_tab = st.tabs(
+        ["① 显著性分析", "② 设计生成与回填", "③ 响应面结果", "④ 合并数据贝叶斯优化"]
     )
-    if not plan.active_variables:
-        st.info("当前数据下没有变量的效应大到需要响应面细化；可以直接看下面的贝叶斯优化建议，或考虑扩大探索范围重新走一轮。")
-    for variable, note in plan.untested_notes.items():
-        st.warning(f"⚠️ 「{PICHIA_VARIABLE_LABELS.get(variable, variable)}」本轮未测，不是「测过发现不显著」：{note}")
-    for variable, note in plan.boundary_notes.items():
-        st.warning(f"{PICHIA_VARIABLE_LABELS.get(variable, variable)}：{note}")
-    for variable, note in plan.overflow_notes.items():
-        st.info(f"{PICHIA_VARIABLE_LABELS.get(variable, variable)}：{note}")
-
-    if plan.combo_interactions:
-        st.markdown("#### 联合探索点的可加性检查")
-        st.caption("检查每个联合探索样本的实测值和「按单变量效应线性叠加」的预测值之间的差距；差距超过阈值提示可能存在变量间交互。")
-        interaction_rows = [
-            {
-                "样本": item["row_id"],
-                "改变的变量": "、".join(PICHIA_VARIABLE_LABELS.get(name, name) for name in item["changed_variables"]),
-                "实测": _num(item["observed"]),
-                "可加性预测": _num(item["additive_prediction"]),
-                "残差": _num(item["residual"]),
-                "可能存在交互": "是" if item["possible_interaction"] else "否",
-            }
-            for item in plan.combo_interactions
-        ]
-        st.dataframe(pd.DataFrame(interaction_rows), width="stretch", hide_index=True)
-
-    if plan.active_variables:
-        st.markdown("#### Round 2 响应面设计（Face-centered CCD）")
-        ccd_rows = []
-        for row in plan.design_rows:
-            display = _pichia_variable_display(row)
-            display["复用 Round1 样本"] = row.get("reused_from_round1") or ""
-            ccd_rows.append(display)
-        st.dataframe(pd.DataFrame(ccd_rows), width="stretch", hide_index=True)
-        reused_count = sum(1 for row in plan.design_rows if row.get("reused_from_round1"))
-        st.caption(f"共 {len(plan.design_rows)} 个设计点，其中 {reused_count} 个和 Round 1 已有数据重合，可以直接复用、不用重新做。")
-
-    _pichia_round2_design_and_backfill_section(plan, run_df)
-    _pichia_round2_results_analysis_section(plan, run_df)
+    with significance_tab:
+        _pichia_round2_significance_section(plan, run_df)
+    with design_tab:
+        _pichia_round2_design_and_backfill_section(plan, run_df)
+    with surface_tab:
+        _pichia_round2_surface_section(plan, run_df)
+    with bo_tab:
+        _pichia_round2_combined_bo_section(plan, run_df)
