@@ -31,7 +31,7 @@ Round 3 的设计生成有三个前提，缺一个就不要开始：
 
 **基线对照为什么必须有。** 两个作用，都不能省：一是"提升多少"这个问题只能靠同批次的基线回答，跨轮比较会混进批次效应；二是本轮自己的噪声估计——有了它才能**用数据判断**轮间是否存在批次效应（把本轮基线噪声和 Round 1 的对比），而不是先拍一个"能不能池化"的假设。
 
-**岭线扫描的方向怎么定。** 需要先给 `CanonicalAnalysis` 加 `eigenvectors` 字段（`np.linalg.eigh` 本来就同时返回，现在丢掉了）。分两种情况：
+**岭线扫描的方向怎么定。** `CanonicalAnalysis.eigenvectors` 已经能给出方向（见「已完成」），符号做了锚定（最大分量恒为正），所以同一批数据每次读到的方向描述一致。分两种情况：
 
 - Round 2 判为 `ridge`（有近零特征值）→ 沿该特征向量方向，在已测范围内均匀取 8 点（含最优点两侧）
 - Round 2 判为 `maximum`（真峰）→ 没有岭线方向可扫，改为最优点邻域：沿 3 个变量各取 ±1 个小步长（6 点）+ 2 个对角点，回答"偏离最优点多少产量才明显掉下去"（这是 `sensitivity_analysis` 给的 plateau 宽度的实测验证）
@@ -53,13 +53,15 @@ Round 3 的设计生成有三个前提，缺一个就不要开始：
 
 比较确认点的实测均值和模型预测。
 
-**⚠️ 实现要点：不能直接拿实测均值去比现有的 `predict_with_confidence_interval`。** 那个函数给的是"平均响应"的置信区间（Var = mse·x₀ᵀ(XᵀX)⁻¹x₀），没有包含新观测自身的抽样误差。正确的比较对象是 **n 个新观测均值的预测区间**：
+**⚠️ 实现要点：不能用默认参数调 `predict_with_confidence_interval`。** 默认（`n_observations=inf`）给的是"平均响应"的置信区间（Var = mse·x₀ᵀ(XᵀX)⁻¹x₀），没有包含新观测自身的抽样误差。确认判据要的是 **n 个新观测均值的预测区间**：
 
 ```
 半宽 = t(1-α/2, df_residual) × √( mse·x₀ᵀ(XᵀX)⁻¹x₀ + mse/n )
 ```
 
-多出来的 `mse/n` 就是 n 个重复自身的抽样误差。直接用现有 CI 会**偏严**——把观测自己的波动算成了模型的错，好模型也会被判不一致。`ResponseSurfaceFit` 已经带了 `mse`/`xtx_inv`/`df_residual` 三个字段，够算，不需要改拟合。
+多出来的 `mse/n` 就是 n 个重复自身的抽样误差。用默认值会**偏严**——把观测自己的波动算成了模型的错，好模型也会被判不一致。
+
+**这块已经实现了**（见上面「已完成」）：确认最优点那 4 个重复就传 `n_observations=4`，折中点那 3 个传 3。传 0 或负数会直接 `ValueError`，不会静默算出个错的区间。
 
 结论口径：
 - 实测均值落在预测区间内 → 响应面在最优点附近可信
@@ -89,10 +91,19 @@ Round 3 的设计生成有三个前提，缺一个就不要开始：
 
 ## 要新写的代码
 
+### 已完成（2026-08-12 提前做掉）
+
+这两块无条件需要、是纯函数、能用合成数据充分验证，而且**独立于 Round 3 也有价值**，所以先做了：
+
+| 做了什么 | 在哪 | 顺带的收益 |
+|---|---|---|
+| `CanonicalAnalysis.eigenvectors` | `recommendation/round2_design.py` | 特征值图原来把 K≥2 的柱子标成"曲率方向 1/2/3"——能看出有个方向没曲率，但看不出是哪个。现在按组成因素命名（如"初始装液量↑"、"培养基 pH↑+补料葡萄糖浓度↓"），canonical 表也多一列「无曲率方向」。**Round 2 自己的分析立刻更好读**，不用等 Round 3 |
+| `predict_with_confidence_interval(..., n_observations=n)` | `recommendation/round2_design.py` | 默认 `inf` 保持原行为（平均响应的置信区间）；给定 n 时加上 `mse/n`，得到 n 个重复均值的预测区间。**这是下面判据 A 最容易实现错的一块，提前用测试把坑关掉**，而不是留一段警告等人去读 |
+
+### 待做
+
 | 要做的 | 在哪 | 备注 |
 |---|---|---|
-| `CanonicalAnalysis` 加 `eigenvectors` | `recommendation/round2_design.py` | `np.linalg.eigh` 已经返回，只是没存 |
-| n 重复均值的预测区间 | `recommendation/round2_design.py` | 扩展 `predict_with_confidence_interval`，加 `n_observations` 参数；n=∞ 时退化为现在的行为 |
 | `assemble_round3_design` | 新增 `recommendation/round3_design.py` | 6 个 block 的组合，种子固定可复现，签名风格照 `assemble_round2_design` |
 | 确认判据计算 | `recommendation/round3_design.py` | 纯函数：吃回填后的 round3 表 + Round 2 的 `fit`，吐两个判据 + 四格定位 |
 | 第三个数据槽 | `App/pichia_common.py` + 新的 Round 3 小节 | 按 ADR-0018 决策 3：加具体的第三个槽，**不做通用化** |

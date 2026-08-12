@@ -24,6 +24,13 @@ from App.pichia_results_io import (
     _pichia_remap_uploaded_columns,
 )
 from App.pichia_round2_bo_views import _pichia_bo_cv_training_rows
+from App.pichia_round2_surface_views import (
+    _pichia_canonical_eigenvalue_chart,
+    _pichia_canonical_table,
+    _pichia_curvature_direction_label,
+    _pichia_flat_direction_text,
+    _pichia_short_variable_label,
+)
 from App.pichia_round2_sections import (
     _pichia_bo_run_signature,
     _pichia_bo_staleness_reasons,
@@ -369,3 +376,123 @@ def test_bo_staleness_says_nothing_when_no_batch_was_ever_stored():
 
     assert _pichia_bo_staleness_reasons(None, current) == []
     assert _pichia_bo_staleness_reasons({}, current) == []
+
+
+def test_curvature_direction_label_names_a_single_dominant_factor():
+    # unit eigenvector lying essentially along one axis -> name that one factor
+    label = _pichia_curvature_direction_label([0.99, 0.14], ["ph", "glucose_pct"])
+
+    assert label == "培养基 pH↑"
+
+
+def test_curvature_direction_label_names_both_halves_of_a_mixed_direction():
+    # an even two-way mix is ~0.707 each; the point of the label is that neither
+    # factor alone describes the direction
+    label = _pichia_curvature_direction_label([0.707, -0.707], ["ph", "glucose_pct"])
+
+    assert label == "培养基 pH↑+补料葡萄糖浓度↓"
+
+
+def test_curvature_direction_label_orders_by_contribution_not_by_variable_order():
+    label = _pichia_curvature_direction_label([0.5, 0.86], ["ph", "glucose_pct"])
+
+    assert label.startswith("补料葡萄糖浓度↑")
+
+
+def test_curvature_direction_label_never_returns_empty():
+    # a direction spread evenly over many factors can leave every component
+    # under the threshold; naming the biggest one beats naming nothing
+    label = _pichia_curvature_direction_label([0.34, 0.33, 0.33], ["ph", "glucose_pct", "volume_ml"])
+
+    assert label == "培养基 pH↑"
+
+
+def test_short_variable_label_drops_the_unit_parenthetical():
+    assert _pichia_short_variable_label("glucose_pct") == "补料葡萄糖浓度"
+    assert _pichia_short_variable_label("volume_ml") == "初始装液量"
+    # nothing to strip -- must stay intact rather than losing a trailing word
+    assert _pichia_short_variable_label("ph") == "培养基 pH"
+
+
+class _Canonical:
+    def __init__(self, classification, eigenvalues, eigenvectors, variables):
+        self.classification = classification
+        self.eigenvalues = eigenvalues
+        self.eigenvectors = eigenvectors
+        self.active_variables = variables
+        self.stationary_point = dict.fromkeys(variables, 0.0)
+        self.stationary_point_in_tested_range = True
+        self.stationary_point_reliable = classification in ("maximum", "minimum", "saddle")
+        self.predicted_at_stationary_point = 1.0
+
+
+def test_flat_direction_is_reported_for_a_ridge():
+    canonical = _Canonical(
+        "ridge",
+        eigenvalues=[-2.0, -0.01],
+        eigenvectors=[[0.707, 0.707], [0.707, -0.707]],
+        variables=["ph", "glucose_pct"],
+    )
+
+    assert _pichia_flat_direction_text(canonical) == "培养基 pH↑+补料葡萄糖浓度↓"
+
+
+def test_flat_direction_is_blank_when_every_direction_has_curvature():
+    # a true peak has no free direction to move along, so promising one would be
+    # actively misleading
+    canonical = _Canonical(
+        "maximum",
+        eigenvalues=[-2.0, -3.0],
+        eigenvectors=[[1.0, 0.0], [0.0, 1.0]],
+        variables=["ph", "glucose_pct"],
+    )
+
+    assert _pichia_flat_direction_text(canonical) == ""
+    assert _pichia_canonical_table(canonical).loc[0, "无曲率方向"] == ""
+
+
+def test_flat_direction_threshold_matches_the_classifier_that_produced_it():
+    # 0.04 is under 5% of 1.0 and 0.06 is over it, so exactly one direction is
+    # "no real curvature" -- reporting both would contradict the classification
+    canonical = _Canonical(
+        "ridge",
+        eigenvalues=[-1.0, -0.06, -0.04],
+        eigenvectors=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        variables=["ph", "glucose_pct", "volume_ml"],
+    )
+
+    assert _pichia_flat_direction_text(canonical, ridge_tolerance=0.05) == "初始装液量↑"
+
+
+def test_flat_direction_handles_a_surface_with_no_curvature_at_all():
+    canonical = _Canonical("flat", eigenvalues=[0.0, 0.0], eigenvectors=[[1.0, 0.0], [0.0, 1.0]], variables=["ph", "glucose_pct"])
+
+    assert "全部方向" in _pichia_flat_direction_text(canonical)
+
+
+def test_eigenvalue_chart_labels_each_bar_with_its_direction():
+    canonical = _Canonical(
+        "ridge",
+        eigenvalues=[-2.0, -0.01],
+        eigenvectors=[[0.707, 0.707], [0.707, -0.707]],
+        variables=["ph", "glucose_pct"],
+    )
+
+    figure = _pichia_canonical_eigenvalue_chart(canonical)
+    bar = figure.data[0]
+
+    # the old chart said "曲率方向 1 / 2", which told the reader a direction was
+    # flat but not which one
+    assert list(bar.x) == ["培养基 pH↑+补料葡萄糖浓度↑", "培养基 pH↑+补料葡萄糖浓度↓"]
+    assert "方向系数" in bar.hovertemplate
+    assert list(bar.customdata) == ["培养基 pH +0.71、补料葡萄糖浓度 +0.71", "培养基 pH +0.71、补料葡萄糖浓度 -0.71"]
+
+
+def test_eigenvalue_chart_keeps_the_plain_variable_name_when_k_is_one():
+    canonical = _Canonical("maximum", eigenvalues=[-2.0], eigenvectors=[[1.0]], variables=["ph"])
+
+    figure = _pichia_canonical_eigenvalue_chart(canonical)
+
+    # with a single factor there is no "combination" to name, and an arrow would
+    # only add noise
+    assert list(figure.data[0].x) == ["培养基 pH"]

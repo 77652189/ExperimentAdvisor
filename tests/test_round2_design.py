@@ -1196,3 +1196,147 @@ def test_summarize_bo_recommendation_handles_zero_predicted_yield_without_crashi
     verdicts = summarize_bo_recommendation(_bo_result_stub(top_yield=0.0, top_std=0.001))
 
     assert any("恰好为 0" in v.message and "0.001" in v.message for v in verdicts)
+
+
+def _curvature_matrix(fit) -> np.ndarray:
+    """Rebuild B from the fitted coefficients, so the eigen-equation check below
+    doesn't just re-derive canonical_analysis from canonical_analysis."""
+    k = len(fit.active_variables)
+    B = np.zeros((k, k))
+    for i, first in enumerate(fit.active_variables):
+        B[i, i] = fit.coefficients.get(f"{first}^2", 0.0)
+        for j, second in enumerate(fit.active_variables):
+            if i < j:
+                B[i, j] = B[j, i] = fit.coefficients.get(f"{first}*{second}", 0.0) / 2.0
+    return B
+
+
+def test_canonical_analysis_eigenvectors_satisfy_the_eigen_equation():
+    # B v == lambda v for every returned pair. This is what catches an
+    # eigenvectors[i] / eigenvectors[:, i] mix-up: np.linalg.eigh returns
+    # eigenvectors as *columns*, and at K=3 the transposed matrix pairs
+    # directions with the wrong eigenvalues. K=2 cannot catch it -- for any 2x2
+    # symmetric B the eigenvector matrix comes out symmetric too, so transposing
+    # it changes nothing.
+    df = _k3_ccd_df()
+    df[TARGET_COL] = (
+        10.0
+        - 1.0 * (df["ph"] - 6.0) ** 2
+        - 3.0 * (df["glucose_pct"] - 1.0) ** 2
+        - 0.02 * (df["volume_ml"] - 50.0) ** 2
+        - 1.0 * (df["ph"] - 6.0) * (df["glucose_pct"] - 1.0)
+        - 0.3 * (df["ph"] - 6.0) * (df["volume_ml"] - 50.0)
+    )
+    fit = fit_ccd_response_surface(df, ["ph", "glucose_pct", "volume_ml"])
+
+    result = canonical_analysis(fit, df)
+    B = _curvature_matrix(fit)
+
+    assert len(result.eigenvectors) == len(result.eigenvalues) == 3
+    for eigenvalue, eigenvector in zip(result.eigenvalues, result.eigenvectors):
+        vector = np.array(eigenvector)
+        assert np.linalg.norm(vector) == pytest.approx(1.0, abs=1e-9)
+        np.testing.assert_allclose(B @ vector, eigenvalue * vector, atol=1e-9)
+
+
+def test_canonical_analysis_eigenvector_signs_are_anchored():
+    # eigh's sign choice is arbitrary, so "the flat direction" could come back as
+    # ph-up/glucose-down or its exact mirror with identical meaning. The largest
+    # component is forced positive so the wording users read stays stable.
+    formulas = [
+        lambda d: 10.0 - 2.0 * (d["ph"] - 6.0) ** 2 - 3.0 * (d["glucose_pct"] - 1.0) ** 2,
+        lambda d: 10.0 - (1.0 * (d["ph"] - 6.0) - 2.0 * (d["glucose_pct"] - 1.0)) ** 2,
+    ]
+    for formula in formulas:
+        df = _k2_ccd_df()
+        df[TARGET_COL] = formula(df)
+        fit = fit_ccd_response_surface(df, ["ph", "glucose_pct"])
+
+        result = canonical_analysis(fit, df)
+
+        for eigenvector in result.eigenvectors:
+            dominant = max(eigenvector, key=abs)
+            assert dominant > 0, f"dominant component should be positive, got {eigenvector}"
+
+
+def test_canonical_analysis_ridge_eigenvector_names_the_free_direction():
+    # yield depends only on the combination (ph - 6) + (glucose - 1), so moving
+    # ph up and glucose down by equal amounts leaves it unchanged. That free
+    # direction is not axis-aligned, so the eigenvalues alone cannot express it
+    # -- the eigenvector is the only place the answer exists.
+    df = _k2_ccd_df()
+    df[TARGET_COL] = 10.0 - ((df["ph"] - 6.0) + (df["glucose_pct"] - 1.0)) ** 2
+    fit = fit_ccd_response_surface(df, ["ph", "glucose_pct"])
+
+    result = canonical_analysis(fit, df)
+
+    assert result.classification == "ridge"
+    flat_index = min(range(len(result.eigenvalues)), key=lambda i: abs(result.eigenvalues[i]))
+    flat = np.array(result.eigenvectors[flat_index])
+    # (1, -1)/sqrt(2), sign-anchored so ph is the positive component
+    np.testing.assert_allclose(flat, np.array([1.0, -1.0]) / np.sqrt(2.0), atol=1e-6)
+
+    # the curved direction is the orthogonal combination
+    curved = np.array(result.eigenvectors[1 - flat_index])
+    np.testing.assert_allclose(np.abs(curved), np.array([1.0, 1.0]) / np.sqrt(2.0), atol=1e-6)
+
+
+def test_prediction_interval_for_n_replicates_is_wider_than_the_mean_response_ci():
+    df = _k2_ccd_df()
+    rng = np.random.default_rng(7)
+    df[TARGET_COL] = (
+        10.0 - 2.0 * (df["ph"] - 6.0) ** 2 - 3.0 * (df["glucose_pct"] - 1.0) ** 2 + rng.normal(0, 0.3, len(df))
+    )
+    fit = fit_ccd_response_surface(df, ["ph", "glucose_pct"])
+    at_optimum = pd.DataFrame([fit.optimum])
+
+    mean_ci = predict_with_confidence_interval(fit, at_optimum)
+    four = predict_with_confidence_interval(fit, at_optimum, n_observations=4)
+    one = predict_with_confidence_interval(fit, at_optimum, n_observations=1)
+
+    def width(frame):
+        return float(frame.loc[0, "ci_high"] - frame.loc[0, "ci_low"])
+
+    # a confirmation run's own sampling error can only add uncertainty, and it
+    # adds less of it the more replicates get measured
+    assert width(one) > width(four) > width(mean_ci)
+    # point estimate untouched -- only the interval changes
+    assert one.loc[0, "predicted"] == pytest.approx(mean_ci.loc[0, "predicted"])
+
+
+def test_prediction_interval_converges_to_the_mean_response_ci_as_n_grows():
+    df = _k2_ccd_df()
+    rng = np.random.default_rng(11)
+    df[TARGET_COL] = 10.0 - 2.0 * (df["ph"] - 6.0) ** 2 + rng.normal(0, 0.2, len(df))
+    fit = fit_ccd_response_surface(df, ["ph", "glucose_pct"])
+    at_optimum = pd.DataFrame([fit.optimum])
+
+    default = predict_with_confidence_interval(fit, at_optimum)
+    huge = predict_with_confidence_interval(fit, at_optimum, n_observations=10**9)
+
+    # the default (inf) is the n -> inf limit of the same formula, not a
+    # separate code path
+    assert huge.loc[0, "se"] == pytest.approx(default.loc[0, "se"], rel=1e-6)
+
+
+def test_prediction_interval_adds_exactly_mse_over_n_to_the_variance():
+    df = _k2_ccd_df()
+    rng = np.random.default_rng(3)
+    df[TARGET_COL] = 10.0 - 2.0 * (df["ph"] - 6.0) ** 2 + rng.normal(0, 0.25, len(df))
+    fit = fit_ccd_response_surface(df, ["ph", "glucose_pct"])
+    points = pd.DataFrame([fit.optimum, {"ph": 5.5, "glucose_pct": 1.5}])
+
+    mean_ci = predict_with_confidence_interval(fit, points)
+    with_three = predict_with_confidence_interval(fit, points, n_observations=3)
+
+    expected = np.sqrt(mean_ci["se"].to_numpy() ** 2 + fit.mse / 3.0)
+    np.testing.assert_allclose(with_three["se"].to_numpy(), expected, rtol=1e-12)
+
+
+def test_prediction_interval_rejects_fewer_than_one_observation():
+    df = _k2_ccd_df()
+    df[TARGET_COL] = 10.0 - 2.0 * (df["ph"] - 6.0) ** 2
+    fit = fit_ccd_response_surface(df, ["ph", "glucose_pct"])
+
+    with pytest.raises(ValueError, match="n_observations"):
+        predict_with_confidence_interval(fit, pd.DataFrame([fit.optimum]), n_observations=0)

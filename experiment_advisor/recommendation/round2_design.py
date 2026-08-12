@@ -1387,20 +1387,34 @@ def predict_with_confidence_interval(
     fit: ResponseSurfaceFit,
     df: pd.DataFrame,
     confidence: float = 0.95,
+    n_observations: float = float("inf"),
 ) -> pd.DataFrame:
-    """Confidence interval on the fitted surface's *mean* response at arbitrary
-    points -- not a prediction interval for one new single observation (that
-    would add + fit.mse to the variance below on top of the fit's own
-    uncertainty). Uses the standard OLS formula Var(y_hat(x0)) = mse * x0'
-    (X'X)^-1 x0, reusing fit.mse/fit.xtx_inv rather than refitting. This is
-    what "how sure are we about the optimum's height" is actually asking:
-    how much the fitted surface itself could move at x0 if round 2 were
-    re-run with fresh noise, not the raw per-observation noise.
+    """Interval around the fitted surface at arbitrary points.
+
+    With the default n_observations=inf this is a confidence interval on the
+    *mean* response: Var(y_hat(x0)) = mse * x0'(X'X)^-1 x0, reusing
+    fit.mse/fit.xtx_inv rather than refitting. That is what "how sure are we
+    about the optimum's height" is asking -- how far the fitted surface itself
+    could move at x0 if round 2 were re-run with fresh noise.
+
+    Pass n_observations=n to get a *prediction* interval for the mean of n new
+    observations at x0, which adds mse/n for those observations' own sampling
+    error. This is the interval a confirmation run has to be judged against:
+    checking whether n measured replicates average out inside the mean-response
+    CI charges the model for noise that belongs to the new measurements, so it
+    runs too strict and can fail a perfectly good model. inf is the n -> inf
+    limit of that same formula, which is why it doubles as the default rather
+    than being a separate code path.
+
+    Note the returned ci_low/ci_high are prediction bounds, not confidence
+    bounds, whenever n_observations is finite.
     """
+    if n_observations < 1:
+        raise ValueError(f"n_observations must be >= 1 (or inf for the mean response), got {n_observations}")
     X, term_names = _response_surface_design_matrix(df, fit.active_variables)
     coefficients_array = np.array([fit.coefficients[name] for name in term_names])
     predicted = X @ coefficients_array
-    variance = np.einsum("ij,jk,ik->i", X, fit.xtx_inv, X) * fit.mse
+    variance = np.einsum("ij,jk,ik->i", X, fit.xtx_inv, X) * fit.mse + fit.mse / n_observations
     se = np.sqrt(np.clip(variance, 0.0, None))
 
     from scipy import stats
@@ -1489,6 +1503,10 @@ def sensitivity_analysis(
 class CanonicalAnalysis:
     active_variables: list[str]
     eigenvalues: list[float]
+    # one unit vector per eigenvalue, same order, each in active_variables order:
+    # eigenvectors[i] is the direction in factor space that eigenvalues[i]
+    # describes the curvature along. Sign-normalised -- see canonical_analysis.
+    eigenvectors: list[list[float]]
     classification: str  # "maximum" | "minimum" | "saddle" | "ridge" | "flat"
     stationary_point: dict[str, float]
     stationary_point_in_tested_range: bool
@@ -1528,6 +1546,12 @@ def canonical_analysis(
     not meaningful (no real curvature to pin down a point at all), so it
     should be read as "roughly where a stationary point would be" rather
     than a precise answer.
+
+    eigenvectors carries the direction each eigenvalue describes curvature
+    along, which is what makes a "ridge" verdict actionable rather than just
+    discouraging: the near-zero eigenvalue's eigenvector is the combination of
+    factors you can move along without losing yield, i.e. the freedom left for
+    picking the cheapest or most robust operating point on the ridge.
     """
     linear = np.array([fit.coefficients.get(variable, 0.0) for variable in fit.active_variables])
     k = len(fit.active_variables)
@@ -1540,7 +1564,18 @@ def canonical_analysis(
                 coefficient = fit.coefficients.get(f"{first}*{second}", 0.0)
                 B[i, j] = B[j, i] = coefficient / 2.0
 
-    eigenvalues, _ = np.linalg.eigh(B)
+    eigenvalues, eigenvector_columns = np.linalg.eigh(B)
+    # An eigenvector is only defined up to sign, and which sign eigh returns is
+    # an artifact of the algorithm. Left alone, "the flat direction" could be
+    # reported as +pH/-glucose in one fit and -pH/+glucose in another with the
+    # same meaning, which reads like a different answer. Anchor it: the largest
+    # component is always positive.
+    eigenvectors: list[list[float]] = []
+    for index in range(eigenvector_columns.shape[1]):
+        vector = eigenvector_columns[:, index]
+        if vector[int(np.argmax(np.abs(vector)))] < 0:
+            vector = -vector
+        eigenvectors.append([float(value) for value in vector])
     scale = float(np.max(np.abs(eigenvalues))) if len(eigenvalues) else 0.0
 
     if scale <= 0:
@@ -1569,6 +1604,7 @@ def canonical_analysis(
     return CanonicalAnalysis(
         active_variables=list(fit.active_variables),
         eigenvalues=[float(value) for value in eigenvalues],
+        eigenvectors=eigenvectors,
         classification=classification,
         stationary_point=stationary_point,
         stationary_point_in_tested_range=in_range,

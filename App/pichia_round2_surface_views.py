@@ -204,15 +204,56 @@ _PICHIA_CANONICAL_LABELS: dict[str, str] = {
 def _pichia_canonical_classification_label(classification: str) -> str:
     return _PICHIA_CANONICAL_LABELS.get(classification, classification)
 
+def _pichia_short_variable_label(variable: str) -> str:
+    """Chinese label without the trailing unit parenthetical -- the full labels
+    are too long to sit side by side as bar-chart tick labels."""
+    return PICHIA_VARIABLE_LABELS.get(variable, variable).split(" (")[0].strip()
+
+def _pichia_curvature_direction_label(eigenvector: list[float], variables: list[str], threshold: float = 0.45) -> str:
+    """Name a curvature direction by the factors that actually make it up.
+
+    Eigenvectors are unit vectors, so a direction lying along one factor has a
+    component near 1, an even two-way mix has ~0.71 each, an even three-way mix
+    ~0.58; 0.45 keeps the genuine contributors and drops the rounding-noise
+    ones. Arrows are the relative sense of the combination (both are the same
+    direction, so "pH↑+装液量↓" and its exact reverse mean the same thing --
+    canonical_analysis anchors the sign so the wording stays stable).
+    """
+    ranked = sorted(zip(variables, eigenvector), key=lambda pair: abs(pair[1]), reverse=True)
+    kept = [pair for pair in ranked if abs(pair[1]) >= threshold] or ranked[:1]
+    return "+".join(f"{_pichia_short_variable_label(name)}{'↑' if value > 0 else '↓'}" for name, value in kept)
+
 PICHIA_CANONICAL_HELP: dict[str, str] = {
     "分类": "经典响应面 canonical analysis 判别：不看网格搜索给出的「测试范围内最好的点」，只看拟合公式本身的曲率，判断这个曲面真实的形状是不是真的有峰。",
     "无约束理论最优点": "不考虑测试范围限制、只看拟合公式本身梯度为零的点——鞍点/岭线情形下这个点的意义有限，请配合下面两列一起看。",
     "该点在测试范围内": "理论最优点是否落在本轮实际测试范围内；「否」时它更多是数学参考点，不能直接当作可以验证的条件。",
     "结果可靠": "「否」表示分类是鞍点以外的退化情形（岭线/近似平坦），此时「理论最优点」不唯一或没有实际意义，不建议照搬这个点去验证。",
     "该点预测产量": "把理论最优点代入拟合模型算出的预测产量，同样只在「结果可靠」为「是」时才有直接参考价值。",
+    "无曲率方向": "岭线/近似平坦时，沿这个变量组合移动几乎不改变预测产量——也就是说这几个变量之间存在一条「同样好」的路径，"
+    "可以在这条路径上按成本、操作难度或稳健性来挑点，而不是死守某个单一坐标。箭头是组合的相对方向（同时↑或按箭头反向都一样）。"
+    "分类为真极大值/极小值/鞍点时这一列为空，因为每个方向都有实质曲率、没有可以自由移动的方向。",
 }
 
-def _pichia_canonical_table(canonical: Any) -> pd.DataFrame:
+def _pichia_flat_direction_text(canonical: Any, ridge_tolerance: float = 0.05) -> str:
+    """The factor combination a ridge/flat surface can be moved along for free.
+
+    Empty for maximum/minimum/saddle: every direction there has real curvature,
+    so there is no such freedom to report. Threshold matches canonical_analysis's
+    own ridge_tolerance so this names exactly the eigenvalues its classification
+    counted as "no real curvature"."""
+    if canonical.classification not in ("ridge", "flat"):
+        return ""
+    scale = max((abs(value) for value in canonical.eigenvalues), default=0.0)
+    if scale <= 0:
+        return "全部方向（拟合面没有任何曲率）"
+    flat = [
+        _pichia_curvature_direction_label(vector, canonical.active_variables)
+        for value, vector in zip(canonical.eigenvalues, canonical.eigenvectors)
+        if abs(value) < ridge_tolerance * scale
+    ]
+    return " / ".join(flat)
+
+def _pichia_canonical_table(canonical: Any, ridge_tolerance: float = 0.05) -> pd.DataFrame:
     point_text = "、".join(
         f"{PICHIA_VARIABLE_LABELS.get(name, name)}={_num(value)}" for name, value in canonical.stationary_point.items()
     )
@@ -222,6 +263,7 @@ def _pichia_canonical_table(canonical: Any) -> pd.DataFrame:
         "该点在测试范围内": "是" if canonical.stationary_point_in_tested_range else "否",
         "结果可靠": "是" if canonical.stationary_point_reliable else "否",
         "该点预测产量": _num(canonical.predicted_at_stationary_point),
+        "无曲率方向": _pichia_flat_direction_text(canonical, ridge_tolerance),
     }
     return pd.DataFrame([row])
 
@@ -238,10 +280,31 @@ def _pichia_canonical_eigenvalue_chart(canonical: Any, ridge_tolerance: float = 
     threshold = ridge_tolerance * scale
     if len(canonical.active_variables) == 1:
         labels = [PICHIA_VARIABLE_LABELS.get(canonical.active_variables[0], canonical.active_variables[0])]
+        details = labels
     else:
-        labels = [f"曲率方向 {index + 1}" for index in range(len(values))]
+        # naming each direction by the factors composing it is the whole point of
+        # the chart: "one of three bars is flat" is only actionable once you know
+        # which combination of factors that flat direction is.
+        labels = [
+            _pichia_curvature_direction_label(vector, canonical.active_variables) for vector in canonical.eigenvectors
+        ]
+        details = [
+            "、".join(
+                f"{_pichia_short_variable_label(name)} {value:+.2f}"
+                for name, value in zip(canonical.active_variables, vector)
+            )
+            for vector in canonical.eigenvectors
+        ]
     colors = [PICHIA_MUTED_COLOR if abs(value) < threshold else ("#e66767" if value < 0 else PICHIA_ACCENT_COLOR) for value in values]
-    fig = go.Figure(go.Bar(x=labels, y=values, marker_color=colors, hovertemplate="%{x}<br>特征值: %{y:.4g}<extra></extra>"))
+    fig = go.Figure(
+        go.Bar(
+            x=labels,
+            y=values,
+            marker_color=colors,
+            customdata=details,
+            hovertemplate="%{x}<br>特征值: %{y:.4g}<br>方向系数: %{customdata}<extra></extra>",
+        )
+    )
     fig.add_hline(y=0, line=dict(color=PICHIA_MUTED_COLOR, width=1))
     if scale > 0:
         fig.add_hrect(y0=-threshold, y1=threshold, fillcolor=PICHIA_MUTED_COLOR, opacity=0.15, line_width=0)
