@@ -1,10 +1,9 @@
-"""Pichia hLF shake-flask page: Round 1 / Round 2 / History tabs.
+"""Pichia hLF shake-flask page: Round 1 / Round 2 tabs.
 
 Split out of App/app.py.
 """
 from __future__ import annotations
 
-import hashlib
 import itertools
 import re
 from io import BytesIO
@@ -57,7 +56,7 @@ from experiment_advisor.recommendation.round2_design import (
     summarize_bo_recommendation,
     summarize_response_surface,
 )
-from App.ui_shared import _num, _clear_ui_cache, _remember_ui_cache
+from App.ui_shared import _num
 
 PICHIA_DATA_DIR = PROJECT_ROOT / "data" / "pichia"
 PICHIA_UPLOAD_DIR = PICHIA_DATA_DIR / "uploads"
@@ -151,13 +150,6 @@ def _pichia_numeric_results(df: pd.DataFrame) -> pd.DataFrame:
         if column in numeric.columns:
             numeric[column] = pd.to_numeric(numeric[column], errors="coerce")
     return numeric
-
-def _pichia_ui_records() -> list[dict[str, Any]]:
-    records = st.session_state.setdefault("pichia_ui_design_records", [])
-    if not isinstance(records, list):
-        records = []
-        st.session_state["pichia_ui_design_records"] = records
-    return records
 
 def _pichia_variable_display(row: dict[str, Any]) -> dict[str, Any]:
     return {PICHIA_VARIABLE_LABELS.get(name, name): _num(row.get(name)) for name in PICHIA_VARIABLES if name in row}
@@ -330,12 +322,10 @@ def _pichia_round1_builder() -> None:
                 n_combo_points=int(n_combo),
                 combo_variables=combo_vars or None,
             )
-            st.session_state.pop("round2_bo_result", None)
             st.success(f"已生成 {counts['total']} 行 Round 1 设计。")
     with reset_col:
         if st.button("直接使用已验证方案（18 样本，不改上面的表单）", width="stretch", key="round1_use_preset"):
             st.session_state["round1_results_df"] = generate_round1_design()
-            st.session_state.pop("round2_bo_result", None)
             st.success("已生成已验证的 18 样本方案。")
 
 def _pichia_yield_scatter_chart(df: pd.DataFrame, value_col: str, title: str) -> go.Figure:
@@ -2478,117 +2468,6 @@ def _pichia_round2_tab() -> None:
     _pichia_round2_design_and_backfill_section(plan, run_df)
     _pichia_round2_results_analysis_section(plan, run_df)
 
-    st.markdown("#### 约束贝叶斯优化建议批次")
-    st.caption(
-        f"OD600 约束阈值：{_num(plan.od_threshold['threshold'])}"
-        f"（= 基线 OD600 均值 x {plan.od_threshold['fraction']}，工程默认值，请研发组结合实际需求确认）。"
-    )
-    n_batch = st.slider("建议批次大小", min_value=3, max_value=15, value=9, key="round2_bo_batch_size")
-    if st.button("生成 Round 2 贝叶斯优化建议", type="primary", key="run_round2_bo"):
-        try:
-            bo_result = recommend_round2_bo_batch(
-                run_df,
-                fixed_values=plan.fixed_values,
-                active_variables=plan.active_variables or list(PICHIA_CONTINUOUS_BOUNDS),
-                od_threshold=plan.od_threshold["threshold"],
-                n_batch=int(n_batch),
-            )
-        except ImportError:
-            st.warning("当前环境未安装 torch/botorch/gpytorch，无法运行贝叶斯优化建议；以上响应面(CCD)部分不受影响。")
-        except ValueError as exc:
-            st.warning(f"未生成建议：{exc}")
-        except Exception as exc:
-            st.warning(f"贝叶斯优化建议生成失败（样本量很小时，GP 拟合可能数值不稳定）：{exc}")
-        else:
-            st.session_state["round2_bo_result"] = bo_result
-            st.success(
-                f"已生成 {len(bo_result['recommendations'])} 个建议"
-                f"（候选池 {bo_result['n_candidates']} 个，满足约束 {bo_result['n_feasible']} 个）。"
-            )
-
-    bo_result = st.session_state.get("round2_bo_result")
-    if bo_result:
-        _pichia_render_bo_recommendation_section(bo_result, plan.active_variables, run_df, "round2_bo_cv_result")
-
-        if st.button("保存本次 Round 2 分析到历史记录", key="save_round2_snapshot"):
-            created_at = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-            record_id = f"r2_{hashlib.sha256(created_at.encode('utf-8')).hexdigest()[:10]}"
-            _pichia_ui_records().append(
-                {
-                    "record_id": record_id,
-                    "record_name": f"Round2 {created_at}",
-                    "created_at": created_at,
-                    "fixed_values": plan.fixed_values,
-                    "active_variables": plan.active_variables,
-                    "od_threshold": plan.od_threshold,
-                    "bo_recommendations": bo_result["recommendations"],
-                }
-            )
-            st.session_state["pichia_ui_record_notice"] = "已保存本次 Round 2 分析"
-            _remember_ui_cache()
-            st.rerun()
-
-def _pichia_history_tab() -> None:
-    st.markdown("### 历史记录（当前会话）")
-    st.caption(
-        "这里保存的是本次会话里生成的 Round 2 分析快照；刷新页面会恢复，重启应用后清空，不写入文件。"
-        "Round 1 的实测结果请用「Round 1」页签里的下载/保存按钮处理，不依赖这里的缓存。"
-    )
-    notice = st.session_state.pop("pichia_ui_record_notice", None)
-    if notice:
-        st.success(str(notice))
-
-    clear_cols = st.columns([1, 1, 3])
-    with clear_cols[0]:
-        clear_confirm = st.checkbox("确认清空界面缓存", key="confirm_clear_pichia_ui_cache")
-    with clear_cols[1]:
-        if st.button("清空界面缓存", disabled=not clear_confirm, key="clear_pichia_ui_cache"):
-            _clear_ui_cache()
-            st.rerun()
-
-    records = _pichia_ui_records()
-    if not records:
-        st.info("暂无历史记录。在「Round 2」页签生成贝叶斯优化建议后可以保存快照。")
-        return
-
-    summary_rows = [
-        {
-            "记录名": record.get("record_name"),
-            "时间": record.get("created_at"),
-            "活跃变量": "、".join(PICHIA_VARIABLE_LABELS.get(name, name) for name in record.get("active_variables", [])),
-            "建议数": len(record.get("bo_recommendations", [])),
-        }
-        for record in records
-    ]
-    st.dataframe(pd.DataFrame(summary_rows), width="stretch", hide_index=True)
-
-    labels = [f"{record.get('created_at', '')} | {record.get('record_name', '')}" for record in records]
-    selected_label = st.selectbox("查看记录", labels, key="pichia_record_selector")
-    selected_index = labels.index(selected_label)
-    record = records[selected_index]
-
-    with st.expander("选中记录详情", expanded=False):
-        fixed_rows = [
-            {"变量": PICHIA_VARIABLE_LABELS.get(name, name), "固定取值": _num(value)}
-            for name, value in (record.get("fixed_values") or {}).items()
-        ]
-        st.dataframe(pd.DataFrame(fixed_rows), width="stretch", hide_index=True)
-        if record.get("bo_recommendations"):
-            rec_rows = []
-            for rec in record["bo_recommendations"]:
-                row = _pichia_variable_display(rec)
-                row["预测产量"] = _num(rec.get("predicted_yield"))
-                rec_rows.append(row)
-            st.dataframe(pd.DataFrame(rec_rows), width="stretch", hide_index=True)
-
-        selected_id = str(record.get("record_id"))
-        delete_confirm = st.checkbox("确认删除选中记录", key=f"confirm_delete_{selected_id}")
-        if st.button("删除选中记录", disabled=not delete_confirm, key=f"delete_record_{selected_id}"):
-            del records[selected_index]
-            st.session_state["pichia_ui_record_notice"] = "已删除选中记录"
-            _remember_ui_cache()
-            st.rerun()
-
 def _pichia_hlf_page() -> None:
     _ensure_pichia_data_area()
     st.caption(
@@ -2596,10 +2475,8 @@ def _pichia_hlf_page() -> None:
         "Round 2 基于 Round 1 实测结果做显著性分析、响应面(CCD)设计和约束贝叶斯优化。"
     )
 
-    round1_tab, round2_tab, history_tab = st.tabs(["Round 1：实验设计", "Round 2：响应面 + 贝叶斯优化", "历史记录"])
+    round1_tab, round2_tab = st.tabs(["Round 1：实验设计", "Round 2：响应面 + 贝叶斯优化"])
     with round1_tab:
         _pichia_round1_tab()
     with round2_tab:
         _pichia_round2_tab()
-    with history_tab:
-        _pichia_history_tab()

@@ -12,8 +12,9 @@
 - Round 2 支持基线噪声估计、效应筛选（含"从未测试"和"测过但不显著"的区分）、技术重复噪声独立诊断（`_pichia_pooled_technical_noise`，不并入显著性阈值，见 ADR-0011）、CCD 响应面设计与带 OD600 可行性筛选的贝叶斯优化候选批次。
 - Round 2 新增一整套"完整设计"能力（见 ADR-0009/0010/0012）：CCD + 补料间隔交互子设计 + LHS 空间填充点的组合生成（`assemble_round2_design`，种子固定、可复现）、配套的下载/上传回填/存档界面，以及回填后的结果分析——CCD 响应面拟合（`fit_ccd_response_surface`：全二次模型、失拟检验、系数显著性、预测最优点，见 ADR-0013）、补料间隔交互显著性检验（`analyze_interval_interaction`）、Round 1+Round 2 合并数据集上的贝叶斯优化重新推荐。
 - Round 2 结果分析的可视化已完成：系数明细表（星号显著性标记）、预测-实测残差图、K=1 响应曲线 / K≥2 时每对活跃变量的 3D 曲面+等高线图（含 OD600 可行边界叠加）、GP 偏依赖图（贝叶斯优化建议附带的不确定度带），以及把上述数字翻译成一句话结论+下一步建议的叙述性 verdict（`summarize_response_surface`，四种情况：失拟显著/最优点卡边界/OD600不可行/一切正常）。
-- Round 2 响应面在点估计之外新增四项深入分析（见 ADR-0014）：预测最优点的置信区间、灵敏度/容许范围（plateau width）分析、经典响应面 canonical analysis（鞍点/岭线/真极大值判别）、产量+OD600 联合满意度优化（Derringer-Suich，和贝叶斯优化的硬过滤并行、不替代）；四种边界情况下界面展示的文案和默认展开的折叠框都不同，`classify_response_surface_case` 是两处判断共用的唯一判据。所有表格和指标在悬浮时都有术语说明（`st.column_config.Column(help=...)`）。
-- 贝叶斯优化补上了模型校验和叙述性解读（见 ADR-0015）：`gp_leave_one_out_cv` 提供留一法交叉验证的 Q²/RMSE（按钮触发，不自动跑），`summarize_bo_recommendation` 把 Q² 分档、OD600 可行候选占比、排名第一推荐点的探索/利用读法翻译成一句话结论——两个 BO 入口（仅 Round1 / 合并数据）共用同一段渲染代码（`_pichia_render_bo_recommendation_section`）。用真实 Y103 数据跑出来的 Q² 目前不理想（仅 round1 时产量模型 Q²≈0.13），这是数据量不足的真实反映，不是 bug。
+- Round 2 响应面在点估计之外新增四项深入分析（见 ADR-0014）：预测最优点的置信区间、灵敏度/容许范围（plateau width）分析、经典响应面 canonical analysis（鞍点/岭线/真极大值判别）、产量+OD600 联合满意度优化（Derringer-Suich，和贝叶斯优化的硬过滤并行、不替代）；四种边界情况下界面展示的文案和默认展开的折叠框都不同，`classify_response_surface_case` 是两处判断共用的唯一判据。所有表格和指标在悬浮时都有术语说明（`st.column_config.Column(help=...)`）。灵敏度/鞍点判别/联合满意度三项现在各配了一张图（扫描曲线+容许范围阴影、曲率特征值条形图、产量vsOD600权衡散点图），不再是纯表格。
+- 贝叶斯优化补上了模型校验和叙述性解读（见 ADR-0015）：`gp_leave_one_out_cv` 提供留一法交叉验证的 Q²/RMSE（按钮触发，不自动跑），`summarize_bo_recommendation` 把 Q² 分档、OD600 可行候选占比、排名第一推荐点的探索/利用读法翻译成一句话结论。用真实 Y103 数据跑出来的 Q² 目前不理想（仅 round1 时产量模型 Q²≈0.13），这是数据量不足的真实反映，不是 bug。
+- 贝叶斯优化只保留合并数据这一个入口（见 ADR-0016）：原来"仅用 Round1 数据"的预览入口和依赖它的历史记录页签已删除——Round 2 的实际设计早就照 CCD 方法论定下来，那个预览入口的建议从没被采纳过，继续留着只是维护负担；`_pichia_render_bo_recommendation_section` 现在只被合并数据这一处调用，但仍保留独立传参（`train_df`/`cv_session_key`）以备将来有第二个入口。
 - App 重启（不是浏览器刷新）会清空 `st.session_state`；`_pichia_restore_persisted_dataset` 在两个页签打开时自动从 `data/pichia/final/` 对应的 CSV 读回，避免"明明保存过、重启后又要重新上传"的体验。
 - Streamlit 默认入口已面向 hLF；旧大肠杆菌/HMO 页面被保留为历史参考。
 - `App/app.py` 按 UI 关注点拆分为 `ui_shared.py`（跨会话缓存 + 共享格式化）、`pages_pichia.py`、`pages_legacy_ecoli.py`；`ingestion/excel_schema_converter.py` 拆分为解析核心与 `migration_audit.py`（新旧数据迁移审计工具）。细节见 git 历史（`archive/REFACTOR_PLAN.md` 留有当时的函数级拆分记录）。
@@ -26,6 +27,7 @@
 | 评估是否要正式扩展补料间隔到 36h（写入 `FIXED_LEVELS`） | 真实 36h 数据回填、且交互检验结果支持 | 见 ADR-0012，当前有意不做 |
 | 决定是否执行候选点 | 研发和工艺团队审阅候选、风险与资源 | 不由软件自动授权 |
 | 决定 `optimizer/standard_bo.py`（历史 E.coli 路径）与 `recommendation/round2_design.py` 的 `recommend_round2_bo_batch`（Pichia Round 2）两套贝叶斯优化实现是否合并 | 需要真实 Round 2 数据暴露出现有实现的具体不足，或产品侧认为有必要 | 待决策，不阻塞其他工作 |
+| Round 2 页面分页 + `pages_pichia.py` 拆分为多个文件 | 无门控，随时可继续；用户已确认方向，要求先出文件划分清单再动手 | 已和用户对齐（2026-08-12）：Round 2 内部加一层 `st.tabs`（显著性分析/设计生成与回填/响应面结果/合并数据贝叶斯优化 四个子页），`pages_pichia.py`（2482 行，Round2 占一半以上）按职责拆成共享工具/Round1/Round2图表与解读/Round2编排几个模块。尚未开始，下一轮先写清单再实施 |
 
 ## 明确不做
 
