@@ -9,6 +9,7 @@ ACTIVE_DOCS = {
     "ARCHITECTURE.md",
     "EXECUTION_PLAN.md",
     "HANDOFF.md",
+    "ROUND3_PLAN.md",
 }
 
 
@@ -39,6 +40,7 @@ def test_adr_index_and_records_are_present():
         "0015-bo-leave-one-out-cv-and-narrative-verdicts.md",
         "0016-remove-round1-only-bo-preview-and-history-tab.md",
         "0017-pichia-ui-module-boundaries-and-round2-subtabs.md",
+        "0018-round3-is-a-single-composite-confirmation-round.md",
     }
 
 
