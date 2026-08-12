@@ -17,6 +17,7 @@ import streamlit as st
 from App.pages_pichia import (
     PICHIA_OD_COL,
     PICHIA_TARGET_COL,
+    _pichia_bo_cv_training_rows,
     _pichia_pooled_technical_noise,
     _pichia_remap_uploaded_columns,
     _pichia_restore_persisted_dataset,
@@ -254,3 +255,22 @@ def test_simulate_round2_results_noop_when_nothing_blank():
     result = _pichia_simulate_round2_results(design)
 
     pd.testing.assert_frame_equal(result, design)
+
+
+def test_bo_cv_training_rows_requires_both_targets_present():
+    # matches recommend_round2_bo_batch's own row selection (dropna on both
+    # yield and od600) -- a row missing only one of the two targets must be
+    # excluded from cross-validating EITHER model, not just the one it's
+    # actually missing, so the CV always validates the same row set the
+    # deployed yield_model/od_model were actually trained on.
+    df = pd.DataFrame(
+        {
+            "run_id": ["R1", "R2", "R3", "R4"],
+            PICHIA_TARGET_COL: [0.01, 0.02, None, 0.04],
+            PICHIA_OD_COL: [30.0, None, 40.0, 41.0],
+        }
+    )
+
+    result = _pichia_bo_cv_training_rows(df)
+
+    assert list(result["run_id"]) == ["R1", "R4"]

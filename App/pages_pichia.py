@@ -1938,14 +1938,26 @@ PICHIA_BO_CV_HELP: dict[str, str] = {
     "留一法 RMSE": "留一法预测误差的均方根，单位和该指标本身一致——越小说明模型对没见过的新条件预测得越准。",
 }
 
+PICHIA_BO_CV_TARGETS: list[tuple[str, str]] = [("产量", "yield"), ("OD600", "od")]
+
 def _pichia_render_bo_cv_result(cv_result: dict[str, Any]) -> None:
     cols = st.columns(2)
-    for col, label, key in zip(cols, ["产量", "OD600"], ["yield", "od"]):
+    for col, (label, key) in zip(cols, PICHIA_BO_CV_TARGETS):
         cv = cv_result[key]
         with col:
             st.metric("Q²", _num(cv["q_squared"]), help=PICHIA_BO_CV_HELP["Q²"])
             st.metric("留一法 RMSE", _num(cv["rmse"]), help=PICHIA_BO_CV_HELP["留一法 RMSE"])
             st.plotly_chart(_pichia_bo_cv_residual_chart(cv, label), width="stretch")
+
+def _pichia_bo_cv_training_rows(train_df: pd.DataFrame) -> pd.DataFrame:
+    """Rows with both target columns present -- the same row selection
+    recommend_round2_bo_batch itself uses to train yield_model/od_model.
+    Cross-validation must filter on both, not just whichever single target
+    it's validating this call: whenever backfill is partial (yield filled
+    but OD600 not, or vice versa), filtering on only one column would
+    validate against a different, larger row set than the one that
+    actually produced the deployed model."""
+    return train_df.dropna(subset=[PICHIA_TARGET_COL, PICHIA_OD_COL])
 
 def _pichia_render_bo_recommendation_section(
     bo_result: dict[str, Any],
@@ -1975,13 +1987,7 @@ def _pichia_render_bo_recommendation_section(
             "样本量不大，但每次点击都会重新拟合多次模型，需要几秒到几十秒，不会自动运行。"
         )
         if st.button("运行交叉验证", key=f"{cv_session_key}_run_button"):
-            # same row selection recommend_round2_bo_batch itself used
-            # (dropna on BOTH target columns, not just the one being
-            # validated this call) -- otherwise, whenever backfill is
-            # partial (yield filled but OD600 not, or vice versa), this
-            # would silently validate against a different, larger row set
-            # than the one that actually produced yield_model/od_model.
-            cv_train_df = train_df.dropna(subset=[PICHIA_TARGET_COL, PICHIA_OD_COL])
+            cv_train_df = _pichia_bo_cv_training_rows(train_df)
             try:
                 yield_cv = gp_leave_one_out_cv(cv_train_df, bo_result["feature_cols"], PICHIA_TARGET_COL)
                 od_cv = gp_leave_one_out_cv(cv_train_df, bo_result["feature_cols"], PICHIA_OD_COL)
