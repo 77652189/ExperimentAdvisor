@@ -163,11 +163,14 @@ def _pichia_render_bo_recommendation_section(
     cv_session_key: str,
 ) -> None:
     """Recommendation table + narrative read + GP partial-dependence + an
-    on-demand leave-one-out cross-validation -- shared by both BO entry
-    points (Round-1-only and the combined Round1+Round2 dataset), which
-    otherwise built an identical table from an identical result-dict shape.
-    Consolidating this avoids the two call sites silently drifting apart on
-    formatting once there's new shared content (the verdicts/CV) to add."""
+    on-demand leave-one-out cross-validation.
+
+    Extracted when there were two BO entry points building an identical table
+    from an identical result-dict shape. ADR-0016 removed the Round1-only one,
+    so the combined Round1+Round2 dataset is the only caller today -- but the
+    training frame and the CV session-state key stay parameters rather than
+    being hard-coded, because that is what lets a second entry point (a later
+    round's dataset, say) reuse this instead of growing a second copy."""
     rows = []
     for rec in bo_result["recommendations"]:
         row = _pichia_variable_display(rec)
