@@ -13,6 +13,7 @@
 - Round 2 新增一整套"完整设计"能力（见 ADR-0009/0010/0012）：CCD + 补料间隔交互子设计 + LHS 空间填充点的组合生成（`assemble_round2_design`，种子固定、可复现）、配套的下载/上传回填/存档界面，以及回填后的结果分析——CCD 响应面拟合（`fit_ccd_response_surface`：全二次模型、失拟检验、系数显著性、预测最优点，见 ADR-0013）、补料间隔交互显著性检验（`analyze_interval_interaction`）、Round 1+Round 2 合并数据集上的贝叶斯优化重新推荐。
 - Round 2 结果分析的可视化已完成：系数明细表（星号显著性标记）、预测-实测残差图、K=1 响应曲线 / K≥2 时每对活跃变量的 3D 曲面+等高线图（含 OD600 可行边界叠加）、GP 偏依赖图（贝叶斯优化建议附带的不确定度带），以及把上述数字翻译成一句话结论+下一步建议的叙述性 verdict（`summarize_response_surface`，四种情况：失拟显著/最优点卡边界/OD600不可行/一切正常）。
 - Round 2 响应面在点估计之外新增四项深入分析（见 ADR-0014）：预测最优点的置信区间、灵敏度/容许范围（plateau width）分析、经典响应面 canonical analysis（鞍点/岭线/真极大值判别）、产量+OD600 联合满意度优化（Derringer-Suich，和贝叶斯优化的硬过滤并行、不替代）；四种边界情况下界面展示的文案和默认展开的折叠框都不同，`classify_response_surface_case` 是两处判断共用的唯一判据。所有表格和指标在悬浮时都有术语说明（`st.column_config.Column(help=...)`）。
+- 贝叶斯优化补上了模型校验和叙述性解读（见 ADR-0015）：`gp_leave_one_out_cv` 提供留一法交叉验证的 Q²/RMSE（按钮触发，不自动跑），`summarize_bo_recommendation` 把 Q² 分档、OD600 可行候选占比、排名第一推荐点的探索/利用读法翻译成一句话结论——两个 BO 入口（仅 Round1 / 合并数据）共用同一段渲染代码（`_pichia_render_bo_recommendation_section`）。用真实 Y103 数据跑出来的 Q² 目前不理想（仅 round1 时产量模型 Q²≈0.13），这是数据量不足的真实反映，不是 bug。
 - App 重启（不是浏览器刷新）会清空 `st.session_state`；`_pichia_restore_persisted_dataset` 在两个页签打开时自动从 `data/pichia/final/` 对应的 CSV 读回，避免"明明保存过、重启后又要重新上传"的体验。
 - Streamlit 默认入口已面向 hLF；旧大肠杆菌/HMO 页面被保留为历史参考。
 - `App/app.py` 按 UI 关注点拆分为 `ui_shared.py`（跨会话缓存 + 共享格式化）、`pages_pichia.py`、`pages_legacy_ecoli.py`；`ingestion/excel_schema_converter.py` 拆分为解析核心与 `migration_audit.py`（新旧数据迁移审计工具）。细节见 git 历史（`archive/REFACTOR_PLAN.md` 留有当时的函数级拆分记录）。
@@ -35,4 +36,4 @@
 
 ## 重新评估点
 
-完成一轮真实 Round 2 回填后，重新评估 CCD 拟合的失拟检验结果、补料间隔交互结论是否成立、以及是否需要 Round 3；在此之前不扩大为通用发酵预测平台。
+完成一轮真实 Round 2 回填后，重新评估 CCD 拟合的失拟检验结果、补料间隔交互结论是否成立、以及是否需要 Round 3；在此之前不扩大为通用发酵预测平台。同时用真实 Round 2 数据重新跑一次留一法交叉验证——仅 round 1 数据下产量模型 Q²≈0.13（偏弱），数据量增加后如果 Q² 仍然不理想，贝叶斯优化推荐的具体数值应该继续"打折看"，不宜直接当作确定结论执行。

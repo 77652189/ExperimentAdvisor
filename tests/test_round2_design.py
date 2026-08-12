@@ -7,6 +7,7 @@ import pytest
 from experiment_advisor.recommendation.round2_design import (
     ALL_VARIABLES,
     FIXED_LEVELS,
+    TARGET_COL,
     FactorEffect,
     analyze_interval_interaction,
     analyze_round1_effects,
@@ -20,6 +21,7 @@ from experiment_advisor.recommendation.round2_design import (
     fit_ccd_response_surface,
     generate_ccd,
     generate_round2_extension_design,
+    gp_leave_one_out_cv,
     od600_threshold,
     optimize_joint_desirability,
     plan_round2,
@@ -27,6 +29,7 @@ from experiment_advisor.recommendation.round2_design import (
     resolve_round2_variables,
     response_surface_grid,
     sensitivity_analysis,
+    summarize_bo_recommendation,
     summarize_response_surface,
 )
 
@@ -1064,3 +1067,98 @@ def test_optimize_joint_desirability_matches_pure_yield_optimum_when_already_fea
     assert result.point["ph"] == pytest.approx(fit.optimum["ph"], abs=0.05)
     assert result.point["glucose_pct"] == pytest.approx(fit.optimum["glucose_pct"], abs=0.05)
     assert result.predicted_yield == pytest.approx(fit.predicted_optimum, abs=0.05)
+
+
+def test_gp_leave_one_out_cv_requires_minimum_points():
+    pytest.importorskip("torch")
+    pytest.importorskip("botorch")
+    pytest.importorskip("gpytorch")
+
+    with pytest.raises(ValueError):
+        gp_leave_one_out_cv(_round1_df().head(4), list(ALL_VARIABLES), TARGET_COL)
+
+
+def test_gp_leave_one_out_cv_reports_internally_consistent_shapes():
+    pytest.importorskip("torch")
+    pytest.importorskip("botorch")
+    pytest.importorskip("gpytorch")
+
+    df = _round1_df()
+    cv = gp_leave_one_out_cv(df, list(ALL_VARIABLES), TARGET_COL, seed=0)
+
+    assert cv["n_points"] == 18
+    for key in ("actual", "predicted", "predicted_std", "residuals"):
+        assert len(cv[key]) == 18
+    assert cv["residuals"] == pytest.approx(cv["actual"] - cv["predicted"])
+    assert (cv["predicted_std"] >= 0).all()
+    assert cv["rmse"] >= 0
+    assert cv["q_squared"] <= 1.0 + 1e-9
+
+
+def test_gp_leave_one_out_cv_q_squared_is_higher_for_learnable_signal_than_pure_noise():
+    pytest.importorskip("torch")
+    pytest.importorskip("botorch")
+    pytest.importorskip("gpytorch")
+
+    rng = np.random.default_rng(0)
+    ph_values = np.linspace(5.0, 7.0, 14)
+    # a smooth, low-noise quadratic in ph -- a GP should predict a held-out
+    # point from its 13 neighbors quite well.
+    learnable_df = pd.DataFrame(
+        {"ph": ph_values, "yield_g_per_l": 10.0 - (ph_values - 6.0) ** 2 + rng.normal(0, 0.01, 14)}
+    )
+    # yield independent of ph entirely -- no held-out point is predictable
+    # from its neighbors any better than guessing the training mean.
+    noise_df = pd.DataFrame({"ph": ph_values, "yield_g_per_l": rng.normal(0, 1.0, 14)})
+
+    learnable_cv = gp_leave_one_out_cv(learnable_df, ["ph"], "yield_g_per_l", seed=0)
+    noise_cv = gp_leave_one_out_cv(noise_df, ["ph"], "yield_g_per_l", seed=0)
+
+    assert learnable_cv["q_squared"] > 0.5
+    assert learnable_cv["q_squared"] > noise_cv["q_squared"]
+
+
+def _bo_result_stub(n_candidates: int = 1000, n_feasible: int = 500, top_yield: float = 0.02, top_std: float = 0.001) -> dict:
+    return {
+        "n_candidates": n_candidates,
+        "n_feasible": n_feasible,
+        "recommendations": [{"predicted_yield": top_yield, "predicted_yield_std": top_std}],
+    }
+
+
+def test_summarize_bo_recommendation_without_cv_still_reads_feasibility_and_uncertainty():
+    verdicts = summarize_bo_recommendation(_bo_result_stub(n_candidates=1000, n_feasible=500, top_yield=0.02, top_std=0.001))
+
+    assert not any("Q²" in v.message for v in verdicts)  # no cv supplied -> no Q^2 verdict at all
+    assert any("利用" in v.message for v in verdicts)  # std is 5% of mean -> confident/exploit read
+
+
+def test_summarize_bo_recommendation_flags_narrow_feasible_region():
+    verdicts = summarize_bo_recommendation(_bo_result_stub(n_candidates=1000, n_feasible=20))
+
+    assert any(v.severity == "warning" and "可行区域很窄" in v.message for v in verdicts)
+
+
+def test_summarize_bo_recommendation_flags_high_uncertainty_top_pick_as_exploration():
+    verdicts = summarize_bo_recommendation(_bo_result_stub(top_yield=0.02, top_std=0.01))  # std = 50% of mean
+
+    assert any("探索" in v.message for v in verdicts)
+
+
+def test_summarize_bo_recommendation_reads_q_squared_buckets():
+    good = summarize_bo_recommendation(_bo_result_stub(), yield_cv={"q_squared": 0.8})
+    weak = summarize_bo_recommendation(_bo_result_stub(), yield_cv={"q_squared": 0.2})
+    bad = summarize_bo_recommendation(_bo_result_stub(), yield_cv={"q_squared": -0.5})
+
+    assert any(v.severity == "success" and "产量" in v.message for v in good)
+    assert any(v.severity == "info" and "产量" in v.message for v in weak)
+    assert any(v.severity == "warning" and "产量" in v.message and "不如直接猜" in v.message for v in bad)
+
+
+def test_summarize_bo_recommendation_reports_both_targets_independently():
+    verdicts = summarize_bo_recommendation(
+        _bo_result_stub(), yield_cv={"q_squared": 0.9}, od_cv={"q_squared": -0.2}
+    )
+
+    assert any(v.severity == "success" and "产量" in v.message for v in verdicts)
+    assert any(v.severity == "warning" and "OD600" in v.message for v in verdicts)

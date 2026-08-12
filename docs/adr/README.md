@@ -16,3 +16,4 @@
 | [0012](0012-new-interval-level-stays-out-of-fixed-levels.md) | accepted | 新补料间隔水平(36h)通过专门交互子设计探索，不写入共享的 `FIXED_LEVELS`。 |
 | [0013](0013-ccd-response-surface-fit-design.md) | accepted | CCD 响应面拟合：全二次 OLS 模型、中心点估纯误差、最优点只搜已测范围。 |
 | [0014](0014-response-surface-deep-dive-four-analyses.md) | accepted | 响应面深入分析四件套：置信区间、灵敏度、鞍点/岭线判别、联合满意度，四种边界情况共用一个判据函数。 |
+| [0015](0015-bo-leave-one-out-cv-and-narrative-verdicts.md) | accepted | 贝叶斯优化补上留一法交叉验证(Q²)和叙述性解读，两个 BO 入口合并共用同一段渲染代码。 |

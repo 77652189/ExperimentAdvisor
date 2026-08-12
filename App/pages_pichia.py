@@ -46,6 +46,7 @@ from experiment_advisor.recommendation.round2_design import (
     classify_response_surface_case,
     evaluate_response_surface,
     fit_ccd_response_surface,
+    gp_leave_one_out_cv,
     gp_partial_dependence,
     optimize_joint_desirability,
     plan_round2,
@@ -53,6 +54,7 @@ from experiment_advisor.recommendation.round2_design import (
     recommend_round2_bo_batch,
     response_surface_grid,
     sensitivity_analysis,
+    summarize_bo_recommendation,
     summarize_response_surface,
 )
 from App.ui_shared import _num, _clear_ui_cache, _remember_ui_cache
@@ -1869,6 +1871,113 @@ def _pichia_render_bo_gp_pdp(bo_result: dict[str, Any], active_variables: list[s
             with pdp_cols[index % 2]:
                 st.plotly_chart(_pichia_gp_pdp_chart(model, feature_cols, variable, anchor), width="stretch")
 
+def _pichia_render_bo_verdicts(bo_result: dict[str, Any], cv_result: dict[str, Any] | None) -> None:
+    """Narrative read of a BO recommendation batch (summarize_bo_recommendation's
+    output), analogous to _pichia_render_response_surface_verdicts for the CCD
+    fit -- unlike that one, the messages here are already fully Chinese (no
+    bare variable-name placeholders to translate), since round2_design.py
+    already writes them that way for this function (see its own docstring)."""
+    yield_cv = cv_result["yield"] if cv_result else None
+    od_cv = cv_result["od"] if cv_result else None
+    verdicts = summarize_bo_recommendation(bo_result, yield_cv=yield_cv, od_cv=od_cv)
+    renderers = {"success": st.success, "info": st.info, "warning": st.warning}
+    for verdict in verdicts:
+        renderers.get(verdict.severity, st.info)(verdict.message)
+
+def _pichia_bo_cv_residual_chart(cv: dict[str, Any], label: str) -> go.Figure:
+    actual = cv["actual"]
+    predicted = cv["predicted"]
+    lo = float(min(actual.min(), predicted.min()))
+    hi = float(max(actual.max(), predicted.max()))
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines", line=dict(color=PICHIA_MUTED_COLOR, dash="dash"), name="y=x", hoverinfo="skip")
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=actual,
+            y=predicted,
+            mode="markers",
+            marker=dict(color=PICHIA_ACCENT_COLOR, size=8),
+            error_y=dict(type="data", array=cv["predicted_std"], visible=True, color=PICHIA_MUTED_COLOR),
+            name="留一法预测",
+            hovertemplate="实测: %{x:.4g}<br>留一法预测: %{y:.4g}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title=f"{label}：留一法预测 vs 实测（误差线是 GP 自己的预测标准差）",
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis_title="实测",
+        yaxis_title="留一法预测",
+        margin=dict(t=50, b=40, l=60, r=30),
+        height=320,
+    )
+    return fig
+
+PICHIA_BO_CV_HELP: dict[str, str] = {
+    "Q²": "留一法交叉验证的预测能力：每次把一个样本从训练集里拿掉、用剩下的重新拟合再预测这个点，和实测值比较算出的类 R² 指标。"
+    "Q²≥0.5 一般认为有实用的预测能力；Q²<0 说明比直接猜训练集均值还差，模型目前不可信。",
+    "留一法 RMSE": "留一法预测误差的均方根，单位和该指标本身一致——越小说明模型对没见过的新条件预测得越准。",
+}
+
+def _pichia_render_bo_cv_result(cv_result: dict[str, Any]) -> None:
+    cols = st.columns(2)
+    for col, label, key in zip(cols, ["产量", "OD600"], ["yield", "od"]):
+        cv = cv_result[key]
+        with col:
+            st.metric("Q²", _num(cv["q_squared"]), help=PICHIA_BO_CV_HELP["Q²"])
+            st.metric("留一法 RMSE", _num(cv["rmse"]), help=PICHIA_BO_CV_HELP["留一法 RMSE"])
+            st.plotly_chart(_pichia_bo_cv_residual_chart(cv, label), width="stretch")
+
+def _pichia_render_bo_recommendation_section(
+    bo_result: dict[str, Any],
+    active_variables: list[str],
+    train_df: pd.DataFrame,
+    cv_session_key: str,
+) -> None:
+    """Recommendation table + narrative read + GP partial-dependence + an
+    on-demand leave-one-out cross-validation -- shared by both BO entry
+    points (Round-1-only and the combined Round1+Round2 dataset), which
+    otherwise built an identical table from an identical result-dict shape.
+    Consolidating this avoids the two call sites silently drifting apart on
+    formatting once there's new shared content (the verdicts/CV) to add."""
+    rows = []
+    for rec in bo_result["recommendations"]:
+        row = _pichia_variable_display(rec)
+        row["预测产量"] = _num(rec.get("predicted_yield"))
+        row["预测产量标准差"] = _num(rec.get("predicted_yield_std"))
+        row["预测 OD600"] = _num(rec.get("predicted_od600"))
+        rows.append(row)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    cv_result = st.session_state.get(cv_session_key)
+    _pichia_render_bo_verdicts(bo_result, cv_result)
+
+    _pichia_render_bo_gp_pdp(bo_result, active_variables)
+
+    with st.expander("模型校验（留一法交叉验证，判断这个 GP 能信到什么程度）", expanded=False):
+        st.caption(
+            "对训练数据逐个样本做「留一法」：把这个样本从训练集里拿掉，用剩下的重新拟合 GP，预测被拿掉的这个点，"
+            "再和它的实测值比较——这样得到的误差才是真正的「预测」误差，不是模型看过这个点之后回头报的拟合误差。"
+            "样本量不大，但每次点击都会重新拟合多次模型，需要几秒到几十秒，不会自动运行。"
+        )
+        if st.button("运行交叉验证", key=f"{cv_session_key}_run_button"):
+            try:
+                yield_cv = gp_leave_one_out_cv(train_df, bo_result["feature_cols"], PICHIA_TARGET_COL)
+                od_cv = gp_leave_one_out_cv(train_df, bo_result["feature_cols"], PICHIA_OD_COL)
+            except ImportError:
+                st.warning("当前环境未安装 torch/botorch/gpytorch，无法运行交叉验证。")
+            except ValueError as exc:
+                st.warning(f"交叉验证暂时无法运行：{exc}")
+            else:
+                st.session_state[cv_session_key] = {"yield": yield_cv, "od": od_cv}
+                st.rerun()
+
+        if cv_result:
+            _pichia_render_bo_cv_result(cv_result)
+
 def _pichia_round2_results_analysis_section(plan: Round2Plan, round1_df: pd.DataFrame) -> None:
     """What becomes analyzable once the Round 2 sheet above is actually
     backfilled -- generating that sheet only produces conditions to test, not
@@ -2074,15 +2183,9 @@ def _pichia_round2_results_analysis_section(plan: Round2Plan, round1_df: pd.Data
 
     combined_bo_result = st.session_state.get("round2_combined_bo_result")
     if combined_bo_result:
-        combined_bo_rows = []
-        for rec in combined_bo_result["recommendations"]:
-            row = _pichia_variable_display(rec)
-            row["预测产量"] = _num(rec.get("predicted_yield"))
-            row["预测产量标准差"] = _num(rec.get("predicted_yield_std"))
-            row["预测 OD600"] = _num(rec.get("predicted_od600"))
-            combined_bo_rows.append(row)
-        st.dataframe(pd.DataFrame(combined_bo_rows), width="stretch", hide_index=True)
-        _pichia_render_bo_gp_pdp(combined_bo_result, plan.active_variables)
+        _pichia_render_bo_recommendation_section(
+            combined_bo_result, plan.active_variables, combined_df, "round2_combined_bo_cv_result"
+        )
 
 def _pichia_round2_tab() -> None:
     st.markdown("### Round 2：显著性分析 → 响应面（CCD）+ 约束贝叶斯优化")
@@ -2243,15 +2346,7 @@ def _pichia_round2_tab() -> None:
 
     bo_result = st.session_state.get("round2_bo_result")
     if bo_result:
-        bo_rows = []
-        for rec in bo_result["recommendations"]:
-            row = _pichia_variable_display(rec)
-            row["预测产量"] = _num(rec.get("predicted_yield"))
-            row["预测产量标准差"] = _num(rec.get("predicted_yield_std"))
-            row["预测 OD600"] = _num(rec.get("predicted_od600"))
-            bo_rows.append(row)
-        st.dataframe(pd.DataFrame(bo_rows), width="stretch", hide_index=True)
-        _pichia_render_bo_gp_pdp(bo_result, plan.active_variables)
+        _pichia_render_bo_recommendation_section(bo_result, plan.active_variables, run_df, "round2_bo_cv_result")
 
         if st.button("保存本次 Round 2 分析到历史记录", key="save_round2_snapshot"):
             created_at = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")

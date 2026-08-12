@@ -36,6 +36,7 @@ def test_adr_index_and_records_are_present():
         "0012-new-interval-level-stays-out-of-fixed-levels.md",
         "0013-ccd-response-surface-fit-design.md",
         "0014-response-surface-deep-dive-four-analyses.md",
+        "0015-bo-leave-one-out-cv-and-narrative-verdicts.md",
     }
 
 

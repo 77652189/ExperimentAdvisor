@@ -692,6 +692,192 @@ def gp_partial_dependence(
     return {"variable": variable, "x": x_values, "mean": mean, "std": std}
 
 
+def gp_leave_one_out_cv(
+    train_df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Leave-one-out cross-validated predictive performance for a
+    SingleTaskGP trained the same way recommend_round2_bo_batch's own _fit
+    helper does (same Normalize/Standardize transforms, same seed). Refits
+    n times -- once per held-out row -- rather than using the closed-form
+    LOO shortcut available for exact GP regression: n here is small (round 1
+    alone is ~15-20 rows, combined with round 2 at most a few dozen), so an
+    explicit refit-and-predict is easy to verify by eye against a single
+    held-out point, unlike reaching into gpytorch's internals for the
+    analytic shortcut -- the same "prefer the checkable approach over the
+    elegant one at this data size" reasoning recommend_round2_bo_batch's own
+    docstring already applies to skipping a joint constrained acquisition
+    function.
+
+    Reports Q^2, the leave-one-out analog of R^2 (1 - SS_loo_residual /
+    SS_total, same total-variance denominator R^2 uses): the standard
+    DOE/QSAR metric for "how well does this model predict a point it never
+    saw," as opposed to R^2's "how well does it fit points it was trained
+    on." recommend_round2_bo_batch's GPs have no analog of
+    fit_ccd_response_surface's R^2/lack-of-fit at all -- this is what fills
+    that gap. A GP with a low or negative Q^2 may still look fine on paper
+    (a GP's own posterior std doesn't reveal this on its own), so this is
+    the one number this module has that answers "should I trust this GP's
+    predictions on a new condition" directly.
+    """
+    try:
+        import torch
+        from botorch.fit import fit_gpytorch_mll
+        from botorch.models import SingleTaskGP
+        from botorch.models.transforms.input import Normalize
+        from botorch.models.transforms.outcome import Standardize
+        from gpytorch.mlls import ExactMarginalLogLikelihood
+    except Exception as exc:  # pragma: no cover - depends on optional runtime deps
+        raise ImportError("gp_leave_one_out_cv requires torch, botorch, and gpytorch.") from exc
+
+    data = train_df[[*feature_cols, target_col]].dropna()
+    n = len(data)
+    if n < 5:
+        raise ValueError("Need at least 5 complete rows to run leave-one-out cross-validation")
+
+    X_all = data[feature_cols].to_numpy(dtype=float)
+    y_all = data[target_col].to_numpy(dtype=float)
+
+    predicted = np.empty(n)
+    predicted_std = np.empty(n)
+    for held_out in range(n):
+        train_mask = np.ones(n, dtype=bool)
+        train_mask[held_out] = False
+        torch.manual_seed(seed)
+        train_X_t = torch.tensor(X_all[train_mask], dtype=torch.double)
+        train_Y_t = torch.tensor(y_all[train_mask], dtype=torch.double).unsqueeze(-1)
+        model = SingleTaskGP(
+            train_X=train_X_t,
+            train_Y=train_Y_t,
+            input_transform=Normalize(d=train_X_t.shape[-1]),
+            outcome_transform=Standardize(m=1),
+        )
+        mll = ExactMarginalLogLikelihood(model.likelihood, model)
+        fit_gpytorch_mll(mll)
+        model.eval()
+        with torch.no_grad():
+            posterior = model.posterior(torch.tensor(X_all[held_out : held_out + 1], dtype=torch.double))
+            predicted[held_out] = float(posterior.mean.squeeze())
+            predicted_std[held_out] = float(posterior.variance.sqrt().squeeze())
+
+    residuals = y_all - predicted
+    ss_loo_residual = float(np.sum(residuals**2))
+    ss_total = float(np.sum((y_all - y_all.mean()) ** 2))
+    q_squared = 1.0 - ss_loo_residual / ss_total if ss_total > 0 else float("nan")
+
+    return {
+        "n_points": n,
+        "actual": y_all,
+        "predicted": predicted,
+        "predicted_std": predicted_std,
+        "residuals": residuals,
+        "rmse": float(np.sqrt(ss_loo_residual / n)),
+        "q_squared": q_squared,
+    }
+
+
+@dataclass(frozen=True)
+class BoRecommendationVerdict:
+    severity: str  # "success" | "info" | "warning"
+    message: str
+
+
+def summarize_bo_recommendation(
+    bo_result: dict[str, Any],
+    yield_cv: dict[str, Any] | None = None,
+    od_cv: dict[str, Any] | None = None,
+) -> list[BoRecommendationVerdict]:
+    """Turns recommend_round2_bo_batch's already-computed numbers -- plus,
+    once run, gp_leave_one_out_cv's Q^2 for each of the two independently
+    fitted GPs -- into the same kind of plain-language read
+    summarize_response_surface gives the CCD fit. Without this, "here are N
+    rows sorted by predicted yield" says nothing about whether those numbers
+    are trustworthy, how narrow the OD600-feasible region actually is, or
+    whether the top recommendation is exploiting well-supported territory
+    or extrapolating into a gap -- three separate reads that would
+    otherwise only exist in whoever happens to look at the raw numbers that
+    particular day.
+
+    yield_cv/od_cv are optional (leave-one-out cross-validation is
+    expensive -- n refits -- so the UI gates it behind its own button
+    rather than running it every time a recommendation batch is generated):
+    the feasibility-ratio and top-candidate-uncertainty reads below don't
+    need it and are always produced; the Q^2 reads only appear once a
+    caller actually supplies them.
+    """
+    verdicts: list[BoRecommendationVerdict] = []
+
+    for label, cv in (("产量", yield_cv), ("OD600", od_cv)):
+        if cv is None:
+            continue
+        q2 = cv["q_squared"]
+        if q2 >= 0.5:
+            verdicts.append(
+                BoRecommendationVerdict("success", f"「{label}」模型的留一法交叉验证 Q²={q2:.3g}，预测能力不错，下面的推荐可以按预测值直接参考。")
+            )
+        elif q2 >= 0.0:
+            verdicts.append(
+                BoRecommendationVerdict(
+                    "info", f"「{label}」模型的留一法交叉验证 Q²={q2:.3g}，预测能力偏弱，推荐结果的具体数值要打折看，排序的大方向仍可参考。"
+                )
+            )
+        else:
+            verdicts.append(
+                BoRecommendationVerdict(
+                    "warning",
+                    f"「{label}」模型的留一法交叉验证 Q²={q2:.3g}（负值）：模型目前还不如直接猜训练集均值，这一批推荐暂时不建议直接采用，"
+                    "更多数据或重新检查特征/噪声可能是当前更值得做的事。",
+                )
+            )
+
+    n_candidates = bo_result.get("n_candidates") or 0
+    n_feasible = bo_result.get("n_feasible") or 0
+    feasible_fraction = n_feasible / n_candidates if n_candidates else 0.0
+    if feasible_fraction < 0.05:
+        verdicts.append(
+            BoRecommendationVerdict(
+                "warning",
+                f"候选池里只有 {feasible_fraction:.1%} 满足 OD600 约束（{n_feasible}/{n_candidates}）：可行区域很窄，"
+                "建议和研发组确认 OD600 阈值是否设得过严，或者考虑扩大活跃变量的探索范围。",
+            )
+        )
+    elif feasible_fraction < 0.2:
+        verdicts.append(
+            BoRecommendationVerdict(
+                "info",
+                f"候选池里 {feasible_fraction:.1%} 满足 OD600 约束（{n_feasible}/{n_candidates}），可行区域比较窄，"
+                "推荐结果集中在这个窄区域内是正常现象。",
+            )
+        )
+
+    recommendations = bo_result.get("recommendations") or []
+    top = recommendations[0] if recommendations else None
+    if top is not None:
+        std = top.get("predicted_yield_std")
+        mean = top.get("predicted_yield")
+        if std is not None and mean:
+            relative_uncertainty = std / abs(mean)
+            if relative_uncertainty > 0.3:
+                verdicts.append(
+                    BoRecommendationVerdict(
+                        "info",
+                        f"排第一的推荐点预测不确定度较大（标准差≈预测值的 {relative_uncertainty:.0%}），说明这个点离已有数据比较远，本质上偏「探索」；"
+                        "如果想要更有把握的「利用」结果，可以看排名靠后但标准差更小的候选。",
+                    )
+                )
+            else:
+                verdicts.append(
+                    BoRecommendationVerdict(
+                        "success",
+                        f"排第一的推荐点预测不确定度不大（标准差≈预测值的 {relative_uncertainty:.0%}），离已有数据支撑较近，属于「利用」而非盲目「探索」。",
+                    )
+                )
+
+    return verdicts
+
+
 ROUND2_TEMPLATE_COLUMNS: list[str] = [
     "run_id",
     "run_type",
