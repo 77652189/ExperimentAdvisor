@@ -159,7 +159,11 @@ def _pichia_round2_significance_section(plan: Round2Plan, run_df: pd.DataFrame) 
         width="stretch",
     )
     if not plan.active_variables:
-        st.info("当前数据下没有变量的效应大到需要响应面细化；可以直接看「④ 合并数据贝叶斯优化」子页的建议，或考虑扩大探索范围重新走一轮。")
+        st.info(
+            "当前数据下没有变量的效应大到需要响应面细化。两条路：一是在「② 设计生成与回填」子页照常生成设计表"
+            "（没有活跃变量时它仍会出补料间隔交互点和 LHS 空间填充点），跑完回填后到「④ 合并数据贝叶斯优化」"
+            "子页拿建议；二是考虑扩大探索范围重新走一轮 Round 1。"
+        )
     for variable, note in plan.untested_notes.items():
         st.warning(f"⚠️ 「{PICHIA_VARIABLE_LABELS.get(variable, variable)}」本轮未测，不是「测过发现不显著」：{note}")
     for variable, note in plan.boundary_notes.items():

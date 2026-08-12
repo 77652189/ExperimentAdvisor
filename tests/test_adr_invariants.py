@@ -85,23 +85,32 @@ def test_adr_0017_surface_views_own_no_page_state():
     fitted model plus data and render it. Reading/writing st.session_state or
     owning a widget key there is what would put page state in two places at
     once, so it's the boundary worth asserting rather than just documenting.
+
+    Checked against the syntax tree rather than the file text: that module's own
+    docstrings explain the rule, so a text search matches its prose and reports
+    a violation that isn't there.
     """
-    text = (REPO_ROOT / "App" / "pichia_round2_surface_views.py").read_text(encoding="utf-8")
-    tree = ast.parse(text)
-    # strip every docstring and comment: this module's own prose explains the
-    # rule, and matching that prose would make the assertion pass for the wrong
-    # reason (and keep passing after a real violation).
-    docstrings = {
-        ast.get_docstring(node)
+    tree = ast.parse((REPO_ROOT / "App" / "pichia_round2_surface_views.py").read_text(encoding="utf-8"))
+
+    session_state_uses = [
+        node.lineno
         for node in ast.walk(tree)
-        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    }
-    body = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
-    for doc in docstrings:
-        if doc:
-            body = body.replace(doc, "")
-    assert "session_state" not in body
-    assert "key=" not in body
+        if isinstance(node, ast.Attribute) and node.attr == "session_state"
+    ]
+    assert not session_state_uses, f"st.session_state used at lines {session_state_uses}"
+
+    # only st.* calls: `key=` on a plain builtin (sorted(..., key=len)) is not a
+    # widget key and has nothing to do with page state.
+    keyed_widgets = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "st"
+        and any(keyword.arg == "key" for keyword in node.keywords)
+    ]
+    assert not keyed_widgets, f"st widget key= at lines {keyed_widgets}"
 
 
 def test_adr_0017_round2_backfill_subtab_precedes_the_subtabs_reading_it():
@@ -113,5 +122,9 @@ def test_adr_0017_round2_backfill_subtab_precedes_the_subtabs_reading_it():
     before the analysis noticed it.
     """
     text = (REPO_ROOT / "App" / "pichia_round2_sections.py").read_text(encoding="utf-8")
-    positions = [text.index(f"with {name}:") for name in ("design_tab", "surface_tab", "bo_tab")]
+    blocks = [f"with {name}:" for name in ("design_tab", "surface_tab", "bo_tab")]
+    # one `with` per sub-tab, or "which one comes first" stops being well defined
+    for block in blocks:
+        assert text.count(block) == 1, f"expected exactly one `{block}`, found {text.count(block)}"
+    positions = [text.index(block) for block in blocks]
     assert positions == sorted(positions)
