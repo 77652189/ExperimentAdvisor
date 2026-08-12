@@ -11,6 +11,8 @@ from experiment_advisor.recommendation.round2_design import (
     analyze_interval_interaction,
     analyze_round1_effects,
     assemble_round2_design,
+    canonical_analysis,
+    classify_response_surface_case,
     effect_confidence_interval,
     estimate_baseline_noise,
     evaluate_response_surface,
@@ -19,9 +21,12 @@ from experiment_advisor.recommendation.round2_design import (
     generate_ccd,
     generate_round2_extension_design,
     od600_threshold,
+    optimize_joint_desirability,
     plan_round2,
+    predict_with_confidence_interval,
     resolve_round2_variables,
     response_surface_grid,
+    sensitivity_analysis,
     summarize_response_surface,
 )
 
@@ -826,3 +831,236 @@ def test_summarize_response_surface_flags_od600_infeasible_optimum():
     assert verdicts[-1].severity == "warning"
     assert "折中点" in _last_message(verdicts)
     assert any("OD600" in v.message and "可行阈值" in v.message for v in verdicts)
+
+
+def test_classify_response_surface_case_matches_each_summarize_branch():
+    # same four fixtures as the four test_summarize_response_surface_* tests
+    # above -- cross-checks that the extracted classifier agrees with
+    # summarize_response_surface's own (message-driven) priority order.
+    clean_df = _k2_ccd_df()
+    clean_df["yield_g_per_l"] = 10.0 - 2.0 * (clean_df["ph"] - 6.0) ** 2 - 3.0 * (clean_df["glucose_pct"] - 1.0) ** 2
+    clean_fit = fit_ccd_response_surface(clean_df, ["ph", "glucose_pct"])
+    assert classify_response_surface_case(clean_fit, clean_df) == "normal"
+
+    center_mask = (clean_df["ph"] == 6.0) & (clean_df["glucose_pct"] == 1.0)
+    # tiny non-zero pure-error noise on the center replicates (same as
+    # test_summarize_response_surface_flags_significant_lack_of_fit_first) --
+    # without it ss_pure_error is exactly 0 and the lack-of-fit F-test can't
+    # be computed at all (falls back to "not significant" by construction,
+    # not because the fit is actually clean).
+    clean_df.loc[center_mask, "yield_g_per_l"] += [0.0, 0.01, -0.01, 0.02, -0.02]
+    corrupted = clean_df.copy()
+    corner_index = corrupted.index[~center_mask][0]
+    corrupted.loc[corner_index, "yield_g_per_l"] += 50.0
+    lof_fit = fit_ccd_response_surface(corrupted, ["ph", "glucose_pct"])
+    assert classify_response_surface_case(lof_fit, corrupted) == "lack_of_fit"
+
+    boundary_df = _k2_ccd_df()
+    boundary_df["yield_g_per_l"] = 10.0 - 2.0 * (boundary_df["ph"] - 6.0) ** 2 + 5.0 * (boundary_df["glucose_pct"] - 0.5)
+    boundary_fit = fit_ccd_response_surface(boundary_df, ["ph", "glucose_pct"])
+    assert classify_response_surface_case(boundary_fit, boundary_df) == "boundary"
+
+    od_df = _k2_ccd_df()
+    od_df["yield_g_per_l"] = 10.0 - 2.0 * (od_df["ph"] - 6.0) ** 2 - 3.0 * (od_df["glucose_pct"] - 1.0) ** 2
+    od_df["od600"] = 20.0 + 2.0 * (od_df["ph"] - 6.0) ** 2 + 3.0 * (od_df["glucose_pct"] - 1.0) ** 2
+    od_fit = fit_ccd_response_surface(od_df, ["ph", "glucose_pct"])
+    od_od_fit = fit_ccd_response_surface(od_df, ["ph", "glucose_pct"], target_col="od600")
+    assert classify_response_surface_case(od_fit, od_df, od_fit=od_od_fit, od_threshold=25.0) == "od_infeasible"
+
+
+def test_predict_with_confidence_interval_is_zero_width_for_a_noiseless_fit():
+    df = _k2_ccd_df()
+    df["yield_g_per_l"] = 10.0 - 2.0 * (df["ph"] - 6.0) ** 2 - 3.0 * (df["glucose_pct"] - 1.0) ** 2
+    fit = fit_ccd_response_surface(df, ["ph", "glucose_pct"])
+
+    result = predict_with_confidence_interval(fit, pd.DataFrame([fit.optimum]))
+
+    assert result.loc[0, "predicted"] == pytest.approx(fit.predicted_optimum)
+    assert result.loc[0, "se"] == pytest.approx(0.0, abs=1e-6)
+    assert result.loc[0, "ci_low"] == pytest.approx(fit.predicted_optimum, abs=1e-6)
+    assert result.loc[0, "ci_high"] == pytest.approx(fit.predicted_optimum, abs=1e-6)
+
+
+def test_predict_with_confidence_interval_widens_with_noise_and_away_from_center():
+    df = _k2_ccd_df()
+    df["yield_g_per_l"] = 10.0 - 2.0 * (df["ph"] - 6.0) ** 2 - 3.0 * (df["glucose_pct"] - 1.0) ** 2
+    rng = np.random.default_rng(0)
+    df["yield_g_per_l"] += rng.normal(0.0, 0.05, len(df))
+    fit = fit_ccd_response_surface(df, ["ph", "glucose_pct"])
+
+    at_optimum = predict_with_confidence_interval(fit, pd.DataFrame([fit.optimum]))
+    assert at_optimum.loc[0, "se"] > 0
+    margin_high = at_optimum.loc[0, "ci_high"] - at_optimum.loc[0, "predicted"]
+    margin_low = at_optimum.loc[0, "predicted"] - at_optimum.loc[0, "ci_low"]
+    assert margin_high == pytest.approx(margin_low)  # symmetric around the point estimate
+
+    # standard OLS prediction variance grows away from the design's centroid
+    # -- a factorial corner of this CCD must have a wider interval than the
+    # (5-times-replicated) center point.
+    center_point = pd.DataFrame([{"ph": 6.0, "glucose_pct": 1.0}])
+    corner_point = pd.DataFrame([{"ph": 6.5, "glucose_pct": 1.25}])
+    ci_center = predict_with_confidence_interval(fit, center_point)
+    ci_corner = predict_with_confidence_interval(fit, corner_point)
+    assert ci_center.loc[0, "se"] < ci_corner.loc[0, "se"]
+
+
+def test_sensitivity_analysis_plateau_matches_analytic_width_for_k1():
+    ph_effect = FactorEffect(
+        variable="ph", kind="continuous", baseline_value=6.0,
+        tested_values={5.0: 9.75, 6.0: 10.0, 7.0: 9.75}, significant=True,
+        best_value=6.0, best_target=10.0, effect_magnitude=0.25,
+    )
+    df = pd.DataFrame(generate_ccd([ph_effect], step_fraction=0.5))  # ph tested range: [5.5, 6.5]
+    # steep curvature (coefficient -8, not -1) so the true 5%-of-peak plateau
+    # (half-width sqrt(0.5/8) = 0.25) sits strictly inside the tested range,
+    # not clipped by it -- lets the plateau boundary itself be hand-checked.
+    df["yield_g_per_l"] = 10.0 - 8.0 * (df["ph"] - 6.0) ** 2
+    fit = fit_ccd_response_surface(df, ["ph"])
+
+    result = sensitivity_analysis(fit, df, tolerance_fraction=0.05, resolution=401)
+    ph_result = result["ph"]
+
+    assert ph_result.peak_x == pytest.approx(6.0, abs=0.01)
+    assert ph_result.peak_value == pytest.approx(10.0, abs=1e-6)
+    assert ph_result.plateau_low == pytest.approx(5.75, abs=0.01)
+    assert ph_result.plateau_high == pytest.approx(6.25, abs=0.01)
+    assert ph_result.touches_lower_bound is False
+    assert ph_result.touches_upper_bound is False
+    assert ph_result.plateau_width_fraction == pytest.approx(0.5, abs=0.02)  # 0.5-wide plateau / 1.0-wide tested range
+
+
+def test_sensitivity_analysis_flags_plateau_touching_tested_range_edge():
+    ph_effect = FactorEffect(
+        variable="ph", kind="continuous", baseline_value=6.0,
+        tested_values={5.0: 9.75, 6.0: 10.0, 7.0: 9.75}, significant=True,
+        best_value=6.0, best_target=10.0, effect_magnitude=0.25,
+    )
+    df = pd.DataFrame(generate_ccd([ph_effect], step_fraction=0.5))
+    # shallow curvature (coefficient -1) -- true half-width sqrt(0.5) = 0.71
+    # is wider than the tested range's own half-width (0.5), so the plateau
+    # must be reported as clipped by the tested range on both sides.
+    df["yield_g_per_l"] = 10.0 - (df["ph"] - 6.0) ** 2
+    fit = fit_ccd_response_surface(df, ["ph"])
+
+    result = sensitivity_analysis(fit, df, tolerance_fraction=0.05)
+    ph_result = result["ph"]
+
+    assert ph_result.touches_lower_bound is True
+    assert ph_result.touches_upper_bound is True
+    assert ph_result.plateau_low == pytest.approx(5.5, abs=0.01)
+    assert ph_result.plateau_high == pytest.approx(6.5, abs=0.01)
+
+
+def test_canonical_analysis_classifies_a_true_maximum():
+    df = _k2_ccd_df()
+    df["yield_g_per_l"] = 10.0 - 2.0 * (df["ph"] - 6.0) ** 2 - 3.0 * (df["glucose_pct"] - 1.0) ** 2
+    fit = fit_ccd_response_surface(df, ["ph", "glucose_pct"])
+
+    result = canonical_analysis(fit, df)
+
+    assert result.classification == "maximum"
+    assert all(value < 0 for value in result.eigenvalues)
+    assert result.stationary_point["ph"] == pytest.approx(6.0, abs=1e-6)
+    assert result.stationary_point["glucose_pct"] == pytest.approx(1.0, abs=1e-6)
+    assert result.stationary_point_in_tested_range is True
+    assert result.stationary_point_reliable is True
+    assert result.predicted_at_stationary_point == pytest.approx(10.0, abs=1e-6)
+
+
+def test_canonical_analysis_classifies_a_true_minimum():
+    df = _k2_ccd_df()
+    df["yield_g_per_l"] = -10.0 + 2.0 * (df["ph"] - 6.0) ** 2 + 3.0 * (df["glucose_pct"] - 1.0) ** 2
+    fit = fit_ccd_response_surface(df, ["ph", "glucose_pct"])
+
+    result = canonical_analysis(fit, df)
+
+    assert result.classification == "minimum"
+    assert all(value > 0 for value in result.eigenvalues)
+    assert result.stationary_point_reliable is True
+
+
+def test_canonical_analysis_classifies_a_saddle_point():
+    df = _k2_ccd_df()
+    df["yield_g_per_l"] = 2.0 * (df["ph"] - 6.0) ** 2 - 3.0 * (df["glucose_pct"] - 1.0) ** 2
+    fit = fit_ccd_response_surface(df, ["ph", "glucose_pct"])
+
+    result = canonical_analysis(fit, df)
+
+    assert result.classification == "saddle"
+    assert any(value < 0 for value in result.eigenvalues)
+    assert any(value > 0 for value in result.eigenvalues)
+    assert result.stationary_point["ph"] == pytest.approx(6.0, abs=1e-6)
+    assert result.stationary_point["glucose_pct"] == pytest.approx(1.0, abs=1e-6)
+    assert result.stationary_point_reliable is True
+
+
+def test_canonical_analysis_classifies_a_ridge_when_one_direction_is_flat():
+    df = _k2_ccd_df()
+    df["yield_g_per_l"] = 10.0 - 2.0 * (df["ph"] - 6.0) ** 2  # zero true dependence on glucose_pct
+    fit = fit_ccd_response_surface(df, ["ph", "glucose_pct"])
+
+    result = canonical_analysis(fit, df)
+
+    assert result.classification == "ridge"
+    assert result.stationary_point_reliable is False
+
+
+def test_canonical_analysis_matches_boundary_case_with_a_rising_ridge():
+    # same scenario as test_summarize_response_surface_flags_boundary_pinned_optimum:
+    # linear-only in glucose_pct (no curvature at all in that direction) is
+    # exactly why the grid-search optimum has nowhere to peak and ends up
+    # pinned at whatever edge the tested range happens to have.
+    df = _k2_ccd_df()
+    df["yield_g_per_l"] = 10.0 - 2.0 * (df["ph"] - 6.0) ** 2 + 5.0 * (df["glucose_pct"] - 0.5)
+    fit = fit_ccd_response_surface(df, ["ph", "glucose_pct"])
+
+    result = canonical_analysis(fit, df)
+
+    assert result.classification == "ridge"
+    assert result.stationary_point_reliable is False
+
+
+def test_optimize_joint_desirability_finds_a_compromise_when_yield_optimum_is_infeasible():
+    df = _k2_ccd_df()
+    df["yield_g_per_l"] = 10.0 - 2.0 * (df["ph"] - 6.0) ** 2 - 3.0 * (df["glucose_pct"] - 1.0) ** 2
+    # od600 decreases with both ph and glucose_pct -- the opposite direction
+    # from yield's peak at center, so raising od600 costs some yield. At the
+    # yield optimum (ph=6, glucose_pct=1) od600 is exactly 27 (95-60-8), so a
+    # threshold of 28 is infeasible right at the yield peak but easily
+    # reachable a short distance away (verified empirically before writing
+    # this assertion, not hand-derived: the actual argmax lands at
+    # ph=5.925/glucose_pct=0.9625 with od600=28.05, yield=9.985).
+    df["od600"] = 95.0 - 10.0 * df["ph"] - 8.0 * df["glucose_pct"]
+    fit = fit_ccd_response_surface(df, ["ph", "glucose_pct"])
+    od_fit = fit_ccd_response_surface(df, ["ph", "glucose_pct"], target_col="od600")
+    at_yield_optimum = float(evaluate_response_surface(od_fit, pd.DataFrame([fit.optimum]))[0])
+    assert at_yield_optimum == pytest.approx(27.0, abs=0.05)
+
+    result = optimize_joint_desirability(fit, od_fit, df, od_threshold=28.0)
+
+    assert result.pure_yield_optimum_value == pytest.approx(fit.predicted_optimum)
+    # the pure-yield optimum itself is OD600-infeasible in this scenario, so
+    # the joint-desirability point must give up some yield to actually clear
+    # the threshold, rather than just re-reporting the infeasible point.
+    assert result.predicted_yield < result.pure_yield_optimum_value
+    assert result.predicted_yield >= result.pure_yield_optimum_value * 0.98  # but only barely
+    assert result.predicted_od600 >= 28.0 - 1e-6
+    assert result.od_desirability == pytest.approx(1.0, abs=1e-6)
+    assert result.composite_desirability == pytest.approx(
+        (result.yield_desirability * result.od_desirability) ** 0.5
+    )
+
+
+def test_optimize_joint_desirability_matches_pure_yield_optimum_when_already_feasible():
+    df = _k2_ccd_df()
+    df["yield_g_per_l"] = 10.0 - 2.0 * (df["ph"] - 6.0) ** 2 - 3.0 * (df["glucose_pct"] - 1.0) ** 2
+    df["od600"] = 30.0  # constant and far above any threshold used below -- always feasible
+    fit = fit_ccd_response_surface(df, ["ph", "glucose_pct"])
+    od_fit = fit_ccd_response_surface(df, ["ph", "glucose_pct"], target_col="od600")
+
+    result = optimize_joint_desirability(fit, od_fit, df, od_threshold=10.0, resolution=41)
+
+    assert result.od_desirability == pytest.approx(1.0)
+    assert result.point["ph"] == pytest.approx(fit.optimum["ph"], abs=0.05)
+    assert result.point["glucose_pct"] == pytest.approx(fit.optimum["glucose_pct"], abs=0.05)
+    assert result.predicted_yield == pytest.approx(fit.predicted_optimum, abs=0.05)

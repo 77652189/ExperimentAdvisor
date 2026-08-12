@@ -42,12 +42,17 @@ from experiment_advisor.recommendation.round2_design import (
     Round2Plan,
     analyze_interval_interaction,
     assemble_round2_design,
+    canonical_analysis,
+    classify_response_surface_case,
     evaluate_response_surface,
     fit_ccd_response_surface,
     gp_partial_dependence,
+    optimize_joint_desirability,
     plan_round2,
+    predict_with_confidence_interval,
     recommend_round2_bo_batch,
     response_surface_grid,
+    sensitivity_analysis,
     summarize_response_surface,
 )
 from App.ui_shared import _num, _clear_ui_cache, _remember_ui_cache
@@ -90,10 +95,22 @@ PICHIA_RUN_TYPE_LABELS = {
     "lhs": "拉丁超立方(LHS)",
 }
 PICHIA_DIVERGING_COLORSCALE = [[0, "#3987e5"], [0.5, "#383835"], [1, "#e66767"]]
-# sequential (one hue, dark->bright) for magnitude data (predicted yield on a
-# contour plot) -- same accent blue as everywhere else in this file, not a
-# second unrelated hue, since low/high here isn't a different kind of thing.
-PICHIA_SEQUENTIAL_COLORSCALE = [[0, "#1b2838"], [0.5, "#2c5fa8"], [1, "#7fb8f5"]]
+# sequential (dark->bright) for magnitude data (predicted yield on a 3D
+# surface/contour) -- several user-selectable options rather than one fixed
+# scale: a 3-stop single hue (the original choice) reads "on brand" but
+# compresses most of the value range into similar-looking mid blues, which
+# made adjacent CCD contour bands hard to tell apart in practice. The default
+# widens that same blue hue's lightness/chroma span instead of changing hue
+# family; the other options trade "on brand" for more perceptual travel
+# (still never a full hue-wheel rainbow -- see dataviz skill's sequential
+# palette guidance).
+PICHIA_SEQUENTIAL_COLORSCALE_OPTIONS: dict[str, list[list[Any]]] = {
+    "扩展单色蓝（推荐）": [[0, "#0a1420"], [0.2, "#163a6b"], [0.4, "#2c5fa8"], [0.6, "#5ba0e0"], [0.8, "#a8d4f5"], [1, "#eaf4fd"]],
+    "单色蓝（原配色）": [[0, "#1b2838"], [0.5, "#2c5fa8"], [1, "#7fb8f5"]],
+    "蓝→青双色": [[0, "#0d1b2e"], [0.25, "#1a5276"], [0.5, "#17a398"], [0.75, "#7ee8d8"], [1, "#eafff9"]],
+    "Viridis（多色，辨识度最高）": [[0, "#440154"], [0.25, "#3b528b"], [0.5, "#21918c"], [0.75, "#5ec962"], [1, "#fde725"]],
+}
+PICHIA_SEQUENTIAL_COLORSCALE_DEFAULT = "扩展单色蓝（推荐）"
 PICHIA_ACCENT_COLOR = "#3987e5"
 PICHIA_MUTED_COLOR = "#6b6a64"
 
@@ -1377,6 +1394,24 @@ def _pichia_significance_stars(p_value: float | None) -> str:
         return "·"
     return ""
 
+# help text for st.dataframe(column_config=...) -- centralized here (rather
+# than inline at each call site) since several tables below share the same
+# jargon (p值/显著性/满意度 etc.) and a hover tooltip is the only place this
+# explanation lives; keeping it in one dict makes it easy to keep the wording
+# consistent across tables instead of drifting per call site.
+PICHIA_COEFFICIENT_HELP: dict[str, str] = {
+    "项": "拟合模型里的一项：截距、某个变量的一次项、二次项（²，弯曲/封顶效应），或两个变量的交互项（×）。",
+    "系数": "这一项对预测产量的贡献方向和大小；正负号表示增加该变量取值是让预测产量升高还是降低，不能跨项直接比较大小（单位不同）。",
+    "标准误": "这个系数估计值本身的不确定度——数值越大，说明换一批数据重新拟合，这个系数可能差很多，估计不稳。",
+    "p值": "这一项是否只是噪声的统计检验：p 值越小，这一项真实存在（不是噪声）的把握越大；一般 p<0.05 认为显著。",
+    "显著性": "p 值的快速参考：*** p<0.001，** p<0.01，* p<0.05，· p<0.1，空白=不显著（p≥0.1）。",
+}
+
+
+def _pichia_coefficient_column_config() -> dict[str, Any]:
+    return {column: st.column_config.Column(help=text) for column, text in PICHIA_COEFFICIENT_HELP.items()}
+
+
 def _pichia_coefficient_table(fit: Any) -> pd.DataFrame:
     rows = []
     for term in fit.term_names:
@@ -1405,6 +1440,190 @@ def _pichia_render_response_surface_verdicts(verdicts: list[Any]) -> None:
         for variable, label in PICHIA_VARIABLE_LABELS.items():
             message = message.replace(f"「{variable}」", f"「{label}」")
         renderers.get(verdict.severity, st.info)(message)
+
+PICHIA_SENSITIVITY_HELP: dict[str, str] = {
+    "变量": "该活跃变量。",
+    "峰值点": "其余活跃变量固定在联合最优点时，单独扫这一个变量得到的预测产量最高点——K≥2 时一般很接近联合最优点，但不必完全相同。",
+    "峰值预测产量": "峰值点对应的预测产量。",
+    "容许范围(±5%)": "峰值点附近、预测产量仍不低于峰值 95% 的取值区间——区间越窄，说明这个变量需要控制得越精确才能拿到接近最优的产量；区间越宽，说明这个变量比较「皮实」，微调影响不大。",
+    "范围宽度": "容许范围的绝对宽度（上限-下限），单位与该变量本身一致。",
+    "占测试范围比例": "容许范围宽度 ÷ 本轮该变量实际测试范围的宽度，例如 0.3 表示容许范围只占本轮测试跨度的 30%。",
+    "触及测试范围边界": "容许范围是否顶到了本轮实际测试范围的边缘——如果是，真实的容许范围可能比这里算出的更宽，只是被测试范围本身卡住了，不代表这个变量真的这么敏感。",
+}
+
+def _pichia_sensitivity_table(sensitivity: dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    for variable, result in sensitivity.items():
+        touches = []
+        if result.touches_lower_bound:
+            touches.append("下限")
+        if result.touches_upper_bound:
+            touches.append("上限")
+        rows.append(
+            {
+                "变量": PICHIA_VARIABLE_LABELS.get(variable, variable),
+                "峰值点": _num(result.peak_x),
+                "峰值预测产量": _num(result.peak_value),
+                "容许范围(±5%)": f"[{_num(result.plateau_low)}, {_num(result.plateau_high)}]",
+                "范围宽度": _num(result.plateau_width),
+                "占测试范围比例": _num(result.plateau_width_fraction),
+                "触及测试范围边界": "、".join(touches) if touches else "否",
+            }
+        )
+    return pd.DataFrame(rows)
+
+_PICHIA_CANONICAL_LABELS: dict[str, str] = {
+    "maximum": "真极大值（有明确的单一峰值）",
+    "minimum": "真极小值（有明确的单一谷值——如果目标是最大化产量，这个方向不是好消息）",
+    "saddle": "鞍点（沿一个方向升高、另一个方向降低，不是真正的「峰」）",
+    "ridge": "岭线/脊线（至少有一个方向几乎没有曲率，可能有一整条线同样好，不存在单一最优点）",
+    "flat": "近似平坦（拟合面在活跃变量范围内几乎没有曲率，模型给不出「哪里最优」的有效信息）",
+}
+
+def _pichia_canonical_classification_label(classification: str) -> str:
+    return _PICHIA_CANONICAL_LABELS.get(classification, classification)
+
+PICHIA_CANONICAL_HELP: dict[str, str] = {
+    "分类": "经典响应面 canonical analysis 判别：不看网格搜索给出的「测试范围内最好的点」，只看拟合公式本身的曲率，判断这个曲面真实的形状是不是真的有峰。",
+    "无约束理论最优点": "不考虑测试范围限制、只看拟合公式本身梯度为零的点——鞍点/岭线情形下这个点的意义有限，请配合下面两列一起看。",
+    "该点在测试范围内": "理论最优点是否落在本轮实际测试范围内；「否」时它更多是数学参考点，不能直接当作可以验证的条件。",
+    "结果可靠": "「否」表示分类是鞍点以外的退化情形（岭线/近似平坦），此时「理论最优点」不唯一或没有实际意义，不建议照搬这个点去验证。",
+    "该点预测产量": "把理论最优点代入拟合模型算出的预测产量，同样只在「结果可靠」为「是」时才有直接参考价值。",
+}
+
+def _pichia_canonical_table(canonical: Any) -> pd.DataFrame:
+    point_text = "、".join(
+        f"{PICHIA_VARIABLE_LABELS.get(name, name)}={_num(value)}" for name, value in canonical.stationary_point.items()
+    )
+    row = {
+        "分类": _pichia_canonical_classification_label(canonical.classification),
+        "无约束理论最优点": point_text,
+        "该点在测试范围内": "是" if canonical.stationary_point_in_tested_range else "否",
+        "结果可靠": "是" if canonical.stationary_point_reliable else "否",
+        "该点预测产量": _num(canonical.predicted_at_stationary_point),
+    }
+    return pd.DataFrame([row])
+
+PICHIA_DESIRABILITY_HELP: dict[str, str] = {
+    "方案": "两个候选点的对比：只看产量能拿到多少，vs. 同时兼顾产量和 OD600 可行性能拿到多少。",
+    "预测产量": "该点代入产量响应面拟合算出的预测产量。",
+    "预测OD600": "该点代入 OD600 响应面拟合算出的预测生长量；纯产量最优点这一行留空，因为选它时完全没考虑 OD600。",
+    "满意度(0~1)": "Derringer-Suich 满意度：产量和 OD600 可行性各自打 0~1 分后取几何平均——只要有一项是 0（例如 OD600 完全不可行），总分就是 0，不会被另一项的高分「平均」掉。",
+}
+
+def _pichia_desirability_table(result: Any) -> pd.DataFrame:
+    def _row(
+        label: str, point: dict[str, float], yield_value: float, od_value: float | None, desirability: float | None
+    ) -> dict[str, Any]:
+        row: dict[str, Any] = {"方案": label}
+        for name, value in point.items():
+            row[PICHIA_VARIABLE_LABELS.get(name, name)] = _num(value)
+        row["预测产量"] = _num(yield_value)
+        # None (not a "-" placeholder string) so the column stays a clean
+        # float dtype -- mixing floats and a literal placeholder string in
+        # one column makes it an "object" dtype, which pyarrow's Streamlit
+        # serialization only handles via a slow, warning-logging fallback
+        # path; a plain missing value renders as an empty cell either way.
+        row["预测OD600"] = _num(od_value) if od_value is not None else None
+        row["满意度(0~1)"] = _num(desirability) if desirability is not None else None
+        return row
+
+    rows = [
+        _row("纯产量最优点（不考虑OD600）", result.pure_yield_optimum, result.pure_yield_optimum_value, None, None),
+        _row("联合满意度最优点", result.point, result.predicted_yield, result.predicted_od600, result.composite_desirability),
+    ]
+    return pd.DataFrame(rows)
+
+def _pichia_desirability_column_config(result: Any) -> dict[str, Any]:
+    config = dict(PICHIA_DESIRABILITY_HELP)
+    for name in result.point:
+        label = PICHIA_VARIABLE_LABELS.get(name, name)
+        config.setdefault(label, f"「{label}」在该方案下的取值。")
+    return {column: st.column_config.Column(help=text) for column, text in config.items()}
+
+def _pichia_render_response_surface_deep_dive(
+    fit: Any,
+    ccd_rows: pd.DataFrame,
+    case: str,
+    od_fit: Any | None,
+    od_threshold: float | None,
+) -> None:
+    """The three deeper analyses beyond the optimum's own CI (already shown
+    inline on the optimum table): sensitivity/plateau width, canonical
+    (saddle/ridge/peak) classification, and joint yield+OD600 desirability.
+    Framed differently depending on `case` (classify_response_surface_case's
+    output, same priority order as summarize_response_surface's own verdict)
+    since the same numbers mean different things depending on whether the
+    fit/data are already trustworthy or not -- e.g. a narrow sensitivity
+    plateau is reassuring in the "normal" case but beside the point when the
+    model has significant lack-of-fit in the first place."""
+    if case == "lack_of_fit":
+        st.warning(
+            "⚠️ 存在显著失拟：下面的灵敏度/鞍点判别/联合优化都基于当前这个（形式可能不对的）二次模型，"
+            "结论只能参考，不能替代重新检查模型形式。"
+        )
+
+    with st.expander("灵敏度分析（最优点附近多「皮实」）", expanded=False):
+        st.caption("固定其余活跃变量在联合最优点，单独扫一个变量：预测产量掉到峰值 95% 以下之前，这个变量还有多大的浮动空间。")
+        sensitivity = sensitivity_analysis(fit, ccd_rows)
+        st.dataframe(
+            _pichia_sensitivity_table(sensitivity),
+            width="stretch",
+            hide_index=True,
+            column_config={column: st.column_config.Column(help=text) for column, text in PICHIA_SENSITIVITY_HELP.items()},
+        )
+        if case == "boundary" and any(result.touches_lower_bound or result.touches_upper_bound for result in sensitivity.values()):
+            st.caption("留意「触及测试范围边界」为「是」的行——这些变量的真实容许范围可能比表里算出的更宽，只是被本轮测试范围卡住了。")
+
+    with st.expander("鞍点/岭线判别（曲面到底是不是真的有峰）", expanded=(case == "boundary")):
+        st.caption("经典响应面 canonical analysis：抛开网格搜索给出的「测试范围内最好的点」，只看拟合公式本身的曲率，判断曲面真实的形状。")
+        canonical = canonical_analysis(fit, ccd_rows)
+        st.dataframe(
+            _pichia_canonical_table(canonical),
+            width="stretch",
+            hide_index=True,
+            column_config={column: st.column_config.Column(help=text) for column, text in PICHIA_CANONICAL_HELP.items()},
+        )
+        if case == "boundary":
+            if canonical.classification in ("ridge", "flat"):
+                st.info(
+                    "这和上面「最优点卡边界」的现象是一致的：曲面在活跃变量的某个方向上几乎没有曲率（呈岭线/近似平坦），"
+                    "网格搜索自然找不到真正的封顶，只能停在测试范围的边缘——不是这个点真的最优，是没有曲率能定出唯一最优点。"
+                )
+            elif not canonical.stationary_point_in_tested_range:
+                point_text = "、".join(
+                    f"{PICHIA_VARIABLE_LABELS.get(name, name)}={_num(value)}" for name, value in canonical.stationary_point.items()
+                )
+                st.info(f"无约束理论最优点在 {point_text}，已经超出本轮测试范围——和「最优点卡边界」的现象一致，建议下一轮把测试范围扩大到能覆盖这个点。")
+        elif case == "normal" and canonical.classification == "maximum" and canonical.stationary_point_in_tested_range:
+            st.caption("曲面呈真极大值、理论最优点也落在测试范围内——和「一切正常」的结论一致，这个联合最优点值得安排验证批次。")
+
+    if od_fit is not None and od_threshold is not None:
+        with st.expander("产量 + OD600 联合优化（满意度）", expanded=(case == "od_infeasible")):
+            st.caption("不把 OD600 当成硬性的「是/否」过滤，而是把产量和 OD600 可行性都打分（0~1），找同时兼顾两者的折中点，并和「只看产量」的最优点对比。")
+            desirability = optimize_joint_desirability(fit, od_fit, ccd_rows, od_threshold)
+            st.dataframe(
+                _pichia_desirability_table(desirability),
+                width="stretch",
+                hide_index=True,
+                column_config=_pichia_desirability_column_config(desirability),
+            )
+            if case == "od_infeasible":
+                yield_cost = (
+                    1.0 - desirability.predicted_yield / desirability.pure_yield_optimum_value
+                    if desirability.pure_yield_optimum_value
+                    else 0.0
+                )
+                feasibility_note = "可行" if desirability.od_desirability >= 1.0 - 1e-6 else "更接近可行（仍未完全达标）"
+                st.success(
+                    f"这就是「折中点」：把最优条件从纯产量最优点换成联合满意度最优点，预测产量下降约 {yield_cost:.1%}，"
+                    f"换来预测 OD600 从不可行变为{feasibility_note}——建议下一轮把这个点也纳入验证批次，而不是只验证纯产量最优点。"
+                )
+            elif desirability.od_desirability >= 1.0 - 1e-6:
+                st.caption("纯产量最优点本身已经满足 OD600 可行性，联合满意度最优点和它基本重合，不存在实质性权衡。")
+
+    if case == "normal":
+        st.caption("以上分析（含上方最优点的置信区间）互相印证：模型形式没问题、最优点不在边界、（若已检验）OD600 可行——建议按前面「下一步建议」安排验证批次。")
 
 def _pichia_response_surface_residual_chart(fit: Any, df: pd.DataFrame) -> go.Figure:
     predicted = evaluate_response_surface(fit, df)
@@ -1460,7 +1679,9 @@ def _pichia_response_surface_curve_chart(fit: Any, df: pd.DataFrame, variable: s
     )
     return fig
 
-def _pichia_response_surface_3d_chart(fit: Any, df: pd.DataFrame, x_variable: str, y_variable: str) -> go.Figure:
+def _pichia_response_surface_3d_chart(
+    fit: Any, df: pd.DataFrame, x_variable: str, y_variable: str, colorscale: list[list[Any]]
+) -> go.Figure:
     """3D twin of _pichia_response_surface_contour_chart, same underlying
     response_surface_grid data -- a surface gives the curvature/peak shape
     away at a glance (is it a sharp peak, a broad plateau, a ridge?), which a
@@ -1476,7 +1697,7 @@ def _pichia_response_surface_3d_chart(fit: Any, df: pd.DataFrame, x_variable: st
             x=grid["x_values"],
             y=grid["y_values"],
             z=grid["z"],
-            colorscale=PICHIA_SEQUENTIAL_COLORSCALE,
+            colorscale=colorscale,
             showscale=False,
             opacity=0.92,
             hovertemplate=f"{x_label}: %{{x:.3g}}<br>{y_label}: %{{y:.3g}}<br>预测产量: %{{z:.4g}}<extra></extra>",
@@ -1522,6 +1743,7 @@ def _pichia_response_surface_contour_chart(
     df: pd.DataFrame,
     x_variable: str,
     y_variable: str,
+    colorscale: list[list[Any]],
     od_fit: Any | None = None,
     od_threshold: float | None = None,
 ) -> go.Figure:
@@ -1533,7 +1755,7 @@ def _pichia_response_surface_contour_chart(
             x=grid["x_values"],
             y=grid["y_values"],
             z=grid["z"],
-            colorscale=PICHIA_SEQUENTIAL_COLORSCALE,
+            colorscale=colorscale,
             colorbar=dict(title="预测产量"),
             hovertemplate=f"{x_label}: %{{x:.3g}}<br>{y_label}: %{{y:.3g}}<br>预测产量: %{{z:.4g}}<extra></extra>",
         )
@@ -1680,22 +1902,51 @@ def _pichia_round2_results_analysis_section(plan: Round2Plan, round1_df: pd.Data
             od_threshold = plan.od_threshold["threshold"]
 
             fit_cols = st.columns(3)
-            fit_cols[0].metric("R²", _num(fit.r_squared))
-            fit_cols[1].metric("样本数 / 参数数", f"{fit.n_points} / {fit.n_params}")
+            fit_cols[0].metric(
+                "R²", _num(fit.r_squared), help="拟合优度：模型解释了多少比例的产量变化，1.0=完美拟合，越低说明二次模型解释力越弱。"
+            )
+            fit_cols[1].metric(
+                "样本数 / 参数数",
+                f"{fit.n_points} / {fit.n_params}",
+                help="用于拟合的 CCD 样本数，和模型需要估计的参数个数（截距+一次项+二次项+交互项）；样本数远大于参数数时，估计才稳。",
+            )
             if fit.lack_of_fit is None:
                 fit_cols[2].metric("失拟检验", "样本不足，无法判断")
             else:
                 verdict = "存在失拟" if fit.lack_of_fit["significant_lack_of_fit"] else "无显著失拟"
-                fit_cols[2].metric("失拟检验", verdict, help=f"p={_num(fit.lack_of_fit['p_value'])}")
+                fit_cols[2].metric(
+                    "失拟检验",
+                    verdict,
+                    help=f"p={_num(fit.lack_of_fit['p_value'])}。检验「二次模型这个形式对不对」，和某一项系数是否显著是两件独立的事。",
+                )
 
             optimum_point = {**plan.fixed_values, **fit.optimum}
             optimum_display = {PICHIA_VARIABLE_LABELS.get(name, name): _num(value) for name, value in optimum_point.items()}
             optimum_display["预测产量"] = _num(fit.predicted_optimum)
+            optimum_ci = predict_with_confidence_interval(fit, pd.DataFrame([fit.optimum]))
+            optimum_display["预测产量 95% CI"] = f"[{_num(optimum_ci.loc[0, 'ci_low'])}, {_num(optimum_ci.loc[0, 'ci_high'])}]"
             if od_fit is not None:
                 predicted_od_at_optimum = float(evaluate_response_surface(od_fit, pd.DataFrame([fit.optimum]))[0])
                 optimum_display["预测OD600"] = _num(predicted_od_at_optimum)
                 optimum_display["OD600可行"] = "是" if predicted_od_at_optimum >= od_threshold else "否"
-            st.dataframe(pd.DataFrame([optimum_display]), width="stretch", hide_index=True)
+            optimum_help: dict[str, str] = {
+                PICHIA_VARIABLE_LABELS.get(name, name): f"响应面拟合在本轮实际测试范围内搜索得到的「{PICHIA_VARIABLE_LABELS.get(name, name)}」最优取值。"
+                for name in optimum_point
+            }
+            optimum_help["预测产量"] = "把最优点代入拟合模型算出的预测产量——模型估计值，不是实测值。"
+            optimum_help["预测产量 95% CI"] = (
+                "这个预测值本身的 95% 置信区间：区间越宽，说明这个「最优点」的产量估计越不确定，"
+                "换一批数据重新做同样的实验，结果可能有明显差异；区间很窄才说明这个数字站得住。"
+            )
+            if od_fit is not None:
+                optimum_help["预测OD600"] = "把最优点代入 OD600 的响应面拟合算出的预测生长量，同样是模型估计值。"
+                optimum_help["OD600可行"] = "预测OD600 是否达到可行阈值；「否」表示这个产量最优点在生长可行性上不成立，不能直接采用。"
+            st.dataframe(
+                pd.DataFrame([optimum_display]),
+                width="stretch",
+                hide_index=True,
+                column_config={col: st.column_config.Column(help=text) for col, text in optimum_help.items()},
+            )
             st.caption("预测最优点的搜索范围限制在 CCD 实际测试过的区间内，不外推到 round 1 原始边界之外。")
 
             _pichia_render_response_surface_verdicts(
@@ -1707,7 +1958,12 @@ def _pichia_round2_results_analysis_section(plan: Round2Plan, round1_df: pd.Data
                     "失拟检验看的是「模型整体形式对不对」；这里的显著性看的是「这一项本身是不是噪声」，两者是独立的两件事。"
                     "显著性：*** p<0.001，** p<0.01，* p<0.05，· p<0.1，空白=不显著——星号只是 p 值的快速参考，具体数值看 p 值列。"
                 )
-                st.dataframe(_pichia_coefficient_table(fit), width="stretch", hide_index=True)
+                st.dataframe(
+                    _pichia_coefficient_table(fit),
+                    width="stretch",
+                    hide_index=True,
+                    column_config=_pichia_coefficient_column_config(),
+                )
 
             st.plotly_chart(_pichia_response_surface_residual_chart(fit, ccd_rows), width="stretch")
 
@@ -1720,20 +1976,36 @@ def _pichia_round2_results_analysis_section(plan: Round2Plan, round1_df: pd.Data
                     "每组图固定其余活跃变量在预测最优点，○是 CCD 实测点，等高线图上的×同理，红色菱形/星标是模型给出的联合最优点；"
                     + ("白色虚线内是预测 OD600 达到可行阈值的区域。" if od_fit is not None else "OD600 拟合暂时无法运行，没有可行边界线。")
                 )
+                colorscale_name = st.selectbox(
+                    "曲面配色",
+                    list(PICHIA_SEQUENTIAL_COLORSCALE_OPTIONS),
+                    index=list(PICHIA_SEQUENTIAL_COLORSCALE_OPTIONS).index(PICHIA_SEQUENTIAL_COLORSCALE_DEFAULT),
+                    help="推荐选项在保持深色主题蓝调的前提下拉宽了明度跨度，比原配色更容易分清相邻等高线档位；"
+                    "越靠后的选项辨识度越高，但和界面主题的贴合度也越低。",
+                    key="pichia_response_surface_colorscale",
+                )
+                colorscale = PICHIA_SEQUENTIAL_COLORSCALE_OPTIONS[colorscale_name]
                 pairs = list(itertools.combinations(plan.active_variables, 2))
                 for x_variable, y_variable in pairs:
                     view_cols = st.columns(2)
                     with view_cols[0]:
                         st.plotly_chart(
-                            _pichia_response_surface_3d_chart(fit, ccd_rows, x_variable, y_variable), width="stretch"
+                            _pichia_response_surface_3d_chart(fit, ccd_rows, x_variable, y_variable, colorscale),
+                            width="stretch",
                         )
                     with view_cols[1]:
                         st.plotly_chart(
                             _pichia_response_surface_contour_chart(
-                                fit, ccd_rows, x_variable, y_variable, od_fit=od_fit, od_threshold=od_threshold
+                                fit, ccd_rows, x_variable, y_variable, colorscale, od_fit=od_fit, od_threshold=od_threshold
                             ),
                             width="stretch",
                         )
+
+            st.markdown("##### 深入分析")
+            case = classify_response_surface_case(
+                fit, ccd_rows, od_fit=od_fit, od_threshold=od_threshold if od_fit is not None else None
+            )
+            _pichia_render_response_surface_deep_dive(fit, ccd_rows, case, od_fit, od_threshold if od_fit is not None else None)
     else:
         st.caption("本轮没有活跃变量进入响应面，跳过 CCD 拟合。")
 

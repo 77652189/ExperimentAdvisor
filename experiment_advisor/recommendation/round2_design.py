@@ -888,6 +888,9 @@ class ResponseSurfaceFit:
     lack_of_fit: dict[str, Any] | None  # None when the design has no replicated point to estimate pure error from
     optimum: dict[str, float]
     predicted_optimum: float
+    mse: float  # residual mean square; with n_points, n_params fixed by construction this is always computable
+    xtx_inv: np.ndarray  # (X'X)^-1 in the same term_names basis -- reused by predict_with_confidence_interval
+    df_residual: int
 
 
 def _response_surface_design_matrix(df: pd.DataFrame, active_variables: list[str]) -> tuple[np.ndarray, list[str]]:
@@ -985,26 +988,28 @@ def fit_ccd_response_surface(
 
     coefficients = {name: float(value) for name, value in zip(term_names, coefficients_array)}
 
-    coefficient_significance: dict[str, dict[str, float]] = {}
-    if df_residual > 0:
-        from scipy import stats
+    # df_residual > 0 always holds here: the n_points <= n_params check above
+    # already raised otherwise, so there is no "not enough data" branch left
+    # to guard against for mse/xtx_inv themselves.
+    from scipy import stats
 
-        mse = ss_residual / df_residual
-        xtx_inv = np.linalg.inv(X.T @ X)
-        standard_errors = np.sqrt(np.clip(mse * np.diag(xtx_inv), 0.0, None))
-        for name, coefficient, se in zip(term_names, coefficients_array, standard_errors):
-            if se > 0:
-                t_statistic = float(coefficient / se)
-                p_value = float(2.0 * stats.t.sf(abs(t_statistic), df_residual))
-            else:
-                t_statistic = float("nan")
-                p_value = float("nan")
-            coefficient_significance[name] = {
-                "se": float(se),
-                "t_statistic": t_statistic,
-                "p_value": p_value,
-                "significant": bool(pd.notna(p_value) and p_value < 0.05),
-            }
+    mse = ss_residual / df_residual
+    xtx_inv = np.linalg.inv(X.T @ X)
+    standard_errors = np.sqrt(np.clip(mse * np.diag(xtx_inv), 0.0, None))
+    coefficient_significance: dict[str, dict[str, float]] = {}
+    for name, coefficient, se in zip(term_names, coefficients_array, standard_errors):
+        if se > 0:
+            t_statistic = float(coefficient / se)
+            p_value = float(2.0 * stats.t.sf(abs(t_statistic), df_residual))
+        else:
+            t_statistic = float("nan")
+            p_value = float("nan")
+        coefficient_significance[name] = {
+            "se": float(se),
+            "t_statistic": t_statistic,
+            "p_value": p_value,
+            "significant": bool(pd.notna(p_value) and p_value < 0.05),
+        }
 
     grids = [np.linspace(float(rows[variable].min()), float(rows[variable].max()), grid_resolution) for variable in active_variables]
     mesh = np.meshgrid(*grids, indexing="ij") if len(grids) > 1 else [grids[0]]
@@ -1026,6 +1031,9 @@ def fit_ccd_response_surface(
         lack_of_fit=lack_of_fit,
         optimum=optimum,
         predicted_optimum=float(predicted_grid[best_index]),
+        mse=float(mse),
+        xtx_inv=xtx_inv,
+        df_residual=int(df_residual),
     )
 
 
@@ -1168,6 +1176,320 @@ def response_surface_grid(
     }
 
 
+def predict_with_confidence_interval(
+    fit: ResponseSurfaceFit,
+    df: pd.DataFrame,
+    confidence: float = 0.95,
+) -> pd.DataFrame:
+    """Confidence interval on the fitted surface's *mean* response at arbitrary
+    points -- not a prediction interval for one new single observation (that
+    would add + fit.mse to the variance below on top of the fit's own
+    uncertainty). Uses the standard OLS formula Var(y_hat(x0)) = mse * x0'
+    (X'X)^-1 x0, reusing fit.mse/fit.xtx_inv rather than refitting. This is
+    what "how sure are we about the optimum's height" is actually asking:
+    how much the fitted surface itself could move at x0 if round 2 were
+    re-run with fresh noise, not the raw per-observation noise.
+    """
+    X, term_names = _response_surface_design_matrix(df, fit.active_variables)
+    coefficients_array = np.array([fit.coefficients[name] for name in term_names])
+    predicted = X @ coefficients_array
+    variance = np.einsum("ij,jk,ik->i", X, fit.xtx_inv, X) * fit.mse
+    se = np.sqrt(np.clip(variance, 0.0, None))
+
+    from scipy import stats
+
+    t_crit = float(stats.t.ppf(0.5 + confidence / 2.0, fit.df_residual))
+    margin = t_crit * se
+    return pd.DataFrame({"predicted": predicted, "se": se, "ci_low": predicted - margin, "ci_high": predicted + margin})
+
+
+@dataclass(frozen=True)
+class SensitivityResult:
+    variable: str
+    tested_low: float
+    tested_high: float
+    peak_x: float
+    peak_value: float
+    plateau_low: float
+    plateau_high: float
+    plateau_width: float
+    plateau_width_fraction: float  # plateau_width / (tested_high - tested_low)
+    touches_lower_bound: bool
+    touches_upper_bound: bool
+
+
+def sensitivity_analysis(
+    fit: ResponseSurfaceFit,
+    df: pd.DataFrame,
+    tolerance_fraction: float = 0.05,
+    resolution: int = 401,
+) -> dict[str, SensitivityResult]:
+    """For each active variable, sweeps it across its own *tested* range
+    (every other active variable held at fit.optimum) and reports the
+    "plateau": the contiguous sub-range around that sweep's own peak within
+    tolerance_fraction of the peak value. A narrow plateau means predicted
+    yield is sensitive to that variable near the optimum (tight process
+    control matters there); a plateau that touches the edge of the tested
+    range means the sweep hasn't turned over within what was tested on that
+    side -- the same tested-range convention fit_ccd_response_surface's own
+    optimum search and summarize_response_surface's boundary check use, not
+    a separate judgement about where the true unconstrained optimum sits
+    (see canonical_analysis for that question).
+    """
+    results: dict[str, SensitivityResult] = {}
+    for variable in fit.active_variables:
+        lower = float(df[variable].min())
+        upper = float(df[variable].max())
+        x_values = np.linspace(lower, upper, resolution)
+        grid = pd.DataFrame({v: np.full(resolution, fit.optimum[v]) for v in fit.active_variables})
+        grid[variable] = x_values
+        predicted = evaluate_response_surface(fit, grid)
+
+        peak_index = int(np.argmax(predicted))
+        peak_value = float(predicted[peak_index])
+        cutoff = peak_value - abs(peak_value) * tolerance_fraction
+
+        within = predicted >= cutoff
+        low_index = peak_index
+        while low_index > 0 and within[low_index - 1]:
+            low_index -= 1
+        high_index = peak_index
+        while high_index < resolution - 1 and within[high_index + 1]:
+            high_index += 1
+
+        span = upper - lower
+        results[variable] = SensitivityResult(
+            variable=variable,
+            tested_low=lower,
+            tested_high=upper,
+            peak_x=float(x_values[peak_index]),
+            peak_value=peak_value,
+            plateau_low=float(x_values[low_index]),
+            plateau_high=float(x_values[high_index]),
+            plateau_width=float(x_values[high_index] - x_values[low_index]),
+            plateau_width_fraction=(float(x_values[high_index] - x_values[low_index]) / span) if span > 0 else float("nan"),
+            touches_lower_bound=low_index == 0,
+            touches_upper_bound=high_index == resolution - 1,
+        )
+    return results
+
+
+@dataclass(frozen=True)
+class CanonicalAnalysis:
+    active_variables: list[str]
+    eigenvalues: list[float]
+    classification: str  # "maximum" | "minimum" | "saddle" | "ridge" | "flat"
+    stationary_point: dict[str, float]
+    stationary_point_in_tested_range: bool
+    stationary_point_reliable: bool  # False for "ridge"/"flat" -- see canonical_analysis docstring
+    predicted_at_stationary_point: float
+
+
+def canonical_analysis(
+    fit: ResponseSurfaceFit,
+    df: pd.DataFrame,
+    ridge_tolerance: float = 0.05,
+) -> CanonicalAnalysis:
+    """Classic RSM canonical analysis (Myers/Montgomery/Anderson-Cook):
+    eigendecomposes the fitted quadratic's curvature matrix B (B_ii = the
+    x_i^2 coefficient, B_ij = half the x_i*x_j coefficient for i != j) to
+    classify the model's unconstrained stationary point as a true maximum,
+    minimum, saddle, or ridge system.
+
+    This catches shapes fit.optimum's bounded grid search cannot tell apart
+    from a real, well-defined peak: a grid search over a bounded region
+    always returns *some* point even when the true stationary point is a
+    saddle (that grid point is just the best of a bad neighborhood, not a
+    hilltop) or lies far outside anything tested (a ridge system may have no
+    interior optimum at all -- yield keeps trading off along a whole line
+    rather than peaking anywhere).
+
+    ridge_tolerance is relative to the largest |eigenvalue|: an eigenvalue
+    smaller than that fraction of the largest is treated as "no real
+    curvature in this direction" rather than a genuine (if small) max/min
+    contribution -- an exact zero eigenvalue is a measure-zero event for a
+    fitted (noisy) model, so a hard ==0 check would never actually fire.
+
+    The unconstrained stationary point is always returned (via least squares,
+    so it stays numerically well-behaved even for a near-singular B), but
+    stationary_point_reliable is False for "ridge"/"flat": in those cases the
+    point is either not unique (anywhere on the ridge is equally valid) or
+    not meaningful (no real curvature to pin down a point at all), so it
+    should be read as "roughly where a stationary point would be" rather
+    than a precise answer.
+    """
+    linear = np.array([fit.coefficients.get(variable, 0.0) for variable in fit.active_variables])
+    k = len(fit.active_variables)
+    B = np.zeros((k, k))
+    for index, variable in enumerate(fit.active_variables):
+        B[index, index] = fit.coefficients.get(f"{variable}^2", 0.0)
+    for i, first in enumerate(fit.active_variables):
+        for j, second in enumerate(fit.active_variables):
+            if i < j:
+                coefficient = fit.coefficients.get(f"{first}*{second}", 0.0)
+                B[i, j] = B[j, i] = coefficient / 2.0
+
+    eigenvalues, _ = np.linalg.eigh(B)
+    scale = float(np.max(np.abs(eigenvalues))) if len(eigenvalues) else 0.0
+
+    if scale <= 0:
+        classification = "flat"
+    else:
+        near_zero = np.abs(eigenvalues) < ridge_tolerance * scale
+        if np.all(near_zero):
+            classification = "flat"
+        elif np.any(near_zero):
+            classification = "ridge"
+        elif np.all(eigenvalues < 0):
+            classification = "maximum"
+        elif np.all(eigenvalues > 0):
+            classification = "minimum"
+        else:
+            classification = "saddle"
+
+    stationary_array, *_ = np.linalg.lstsq(B, -0.5 * linear, rcond=None)
+    stationary_point = {variable: float(stationary_array[index]) for index, variable in enumerate(fit.active_variables)}
+    predicted_at_stationary = float(evaluate_response_surface(fit, pd.DataFrame([stationary_point]))[0])
+    in_range = all(
+        float(df[variable].min()) <= stationary_point[variable] <= float(df[variable].max())
+        for variable in fit.active_variables
+    )
+
+    return CanonicalAnalysis(
+        active_variables=list(fit.active_variables),
+        eigenvalues=[float(value) for value in eigenvalues],
+        classification=classification,
+        stationary_point=stationary_point,
+        stationary_point_in_tested_range=in_range,
+        stationary_point_reliable=classification in ("maximum", "minimum", "saddle"),
+        predicted_at_stationary_point=predicted_at_stationary,
+    )
+
+
+def _one_sided_desirability(values: np.ndarray, low: float, high: float, weight: float = 1.0) -> np.ndarray:
+    """Derringer-Suich one-sided ("larger is better") desirability ramp: 0 at
+    or below `low`, 1 at or above `high`, a ramp of shape `weight` in
+    between. Degenerates to a hard 0/1 step when high <= low (nothing to ramp
+    across), rather than dividing by zero."""
+    if high <= low:
+        return np.where(values >= high, 1.0, 0.0)
+    scaled = np.clip((values - low) / (high - low), 0.0, 1.0)
+    return scaled**weight
+
+
+@dataclass(frozen=True)
+class DesirabilityResult:
+    point: dict[str, float]
+    predicted_yield: float
+    predicted_od600: float
+    yield_desirability: float
+    od_desirability: float
+    composite_desirability: float
+    yield_low: float
+    yield_high: float
+    od_low: float
+    od_high: float
+    pure_yield_optimum: dict[str, float]
+    pure_yield_optimum_value: float
+
+
+def optimize_joint_desirability(
+    fit: ResponseSurfaceFit,
+    od_fit: ResponseSurfaceFit,
+    df: pd.DataFrame,
+    od_threshold: float,
+    yield_weight: float = 1.0,
+    od_weight: float = 1.0,
+    resolution: int = 41,
+) -> DesirabilityResult:
+    """Derringer-Suich joint desirability optimization over the same
+    CCD-tested grid as fit.optimum's own search: scores predicted yield and
+    predicted OD600 feasibility on one shared 0-1 scale and jointly optimizes
+    their composite, rather than treating OD600 as a hard pass/fail filter
+    the way recommend_round2_bo_batch's BO track does.
+
+    Most useful when fit.optimum (pure yield) turns out OD600-infeasible:
+    this reports the best available compromise point, and exactly how much
+    predicted yield it costs relative to the unconstrained yield optimum
+    (pure_yield_optimum/pure_yield_optimum_value), rather than leaving
+    "infeasible, try something else" with no concrete alternative.
+
+    composite_desirability is the geometric mean of the two individual
+    desirabilities (equal-importance Derringer-Suich composite): a hard 0 on
+    either one collapses the whole composite to 0, so an infeasible OD600
+    point is never "averaged away" by a high yield score.
+    """
+    grids = [np.linspace(float(df[variable].min()), float(df[variable].max()), resolution) for variable in fit.active_variables]
+    mesh = np.meshgrid(*grids, indexing="ij") if len(grids) > 1 else [grids[0]]
+    flat_columns = [component.ravel() for component in mesh]
+    grid_points = pd.DataFrame({variable: flat_columns[index] for index, variable in enumerate(fit.active_variables)})
+
+    predicted_yield = evaluate_response_surface(fit, grid_points)
+    predicted_od = evaluate_response_surface(od_fit, grid_points)
+
+    yield_low = float(predicted_yield.min())
+    yield_high = float(predicted_yield.max())
+    od_low = float(predicted_od.min())
+
+    yield_desirability = _one_sided_desirability(predicted_yield, yield_low, yield_high, yield_weight)
+    od_desirability = _one_sided_desirability(predicted_od, od_low, od_threshold, od_weight)
+    composite = np.sqrt(np.clip(yield_desirability * od_desirability, 0.0, None))
+
+    best_index = int(np.argmax(composite))
+    point = {variable: float(flat_columns[index][best_index]) for index, variable in enumerate(fit.active_variables)}
+
+    return DesirabilityResult(
+        point=point,
+        predicted_yield=float(predicted_yield[best_index]),
+        predicted_od600=float(predicted_od[best_index]),
+        yield_desirability=float(yield_desirability[best_index]),
+        od_desirability=float(od_desirability[best_index]),
+        composite_desirability=float(composite[best_index]),
+        yield_low=yield_low,
+        yield_high=yield_high,
+        od_low=od_low,
+        od_high=od_threshold,
+        pure_yield_optimum=dict(fit.optimum),
+        pure_yield_optimum_value=fit.predicted_optimum,
+    )
+
+
+def classify_response_surface_case(
+    fit: ResponseSurfaceFit,
+    df: pd.DataFrame,
+    od_fit: ResponseSurfaceFit | None = None,
+    od_threshold: float | None = None,
+    boundary_tol: float = 0.02,
+) -> str:
+    """Which of summarize_response_surface's four priority-ordered cases
+    currently applies: "lack_of_fit" > "boundary" > "od_infeasible" >
+    "normal" -- the same precedence summarize_response_surface's own
+    next-step verdict is built from (it calls this function for that
+    verdict), exposed separately so a caller building its own UI can branch
+    on the classification directly instead of pattern-matching
+    summarize_response_surface's Chinese message text to recover it.
+    """
+    if fit.lack_of_fit is not None and fit.lack_of_fit["significant_lack_of_fit"]:
+        return "lack_of_fit"
+
+    for variable in fit.active_variables:
+        lower = float(df[variable].min())
+        upper = float(df[variable].max())
+        span = upper - lower
+        if span <= 0:
+            continue
+        value = fit.optimum[variable]
+        if (value - lower) / span < boundary_tol or (upper - value) / span < boundary_tol:
+            return "boundary"
+
+    if od_fit is not None and od_threshold is not None:
+        predicted_od = float(evaluate_response_surface(od_fit, pd.DataFrame([fit.optimum]))[0])
+        if predicted_od < od_threshold:
+            return "od_infeasible"
+
+    return "normal"
+
+
 @dataclass(frozen=True)
 class ResponseSurfaceVerdict:
     severity: str  # "success" | "info" | "warning"
@@ -1202,11 +1524,9 @@ def summarize_response_surface(
     else:
         verdicts.append(ResponseSurfaceVerdict("warning", f"拟合优度偏低（R²={fit.r_squared:.3g}），二次模型可能不足以描述这批数据，后面的结论要谨慎看待。"))
 
-    lack_of_fit_bad = False
     if fit.lack_of_fit is None:
         verdicts.append(ResponseSurfaceVerdict("info", "样本不足以做失拟检验，模型形式对不对暂时无法判断。"))
     elif fit.lack_of_fit["significant_lack_of_fit"]:
-        lack_of_fit_bad = True
         verdicts.append(
             ResponseSurfaceVerdict(
                 "warning",
@@ -1227,7 +1547,6 @@ def summarize_response_surface(
         elif linear_stats and linear_stats["significant"]:
             verdicts.append(ResponseSurfaceVerdict("info", f"「{variable}」在测试范围内大致是单调趋势，暂时没看到弯曲/封顶的迹象。"))
 
-    any_boundary = False
     for variable in fit.active_variables:
         lower = float(df[variable].min())
         upper = float(df[variable].max())
@@ -1236,7 +1555,6 @@ def summarize_response_surface(
             continue
         value = fit.optimum[variable]
         if (value - lower) / span < boundary_tol:
-            any_boundary = True
             verdicts.append(
                 ResponseSurfaceVerdict(
                     "warning",
@@ -1245,7 +1563,6 @@ def summarize_response_surface(
                 )
             )
         elif (upper - value) / span < boundary_tol:
-            any_boundary = True
             verdicts.append(
                 ResponseSurfaceVerdict(
                     "warning",
@@ -1267,18 +1584,14 @@ def summarize_response_surface(
                 )
             )
 
-    if lack_of_fit_bad:
-        next_step = "先不要用这个模型的最优点做决策：建议重新检查是否漏看了变量/交互，或尝试更高阶的模型，而不是直接推进到验证实验。"
-        severity = "warning"
-    elif any_boundary:
-        next_step = "建议先扩大测试范围，而不是直接安排验证批次——当前最优点很可能不是真正的最优，只是测试范围的边缘。"
-        severity = "warning"
-    elif od_feasible is False:
-        next_step = "建议在产量和 OD600 可行性之间找折中点（参考「合并数据后的贝叶斯优化建议」），不要直接采用这个纯产量最优点。"
-        severity = "warning"
-    else:
-        next_step = "模型和数据一致、最优点在测试范围内部且（若已检验）可行：建议安排 1-2 个验证批次，实测这个预测最优点附近的条件，确认与模型预测一致后再定为下一轮基准。"
-        severity = "success"
+    case = classify_response_surface_case(fit, df, od_fit=od_fit, od_threshold=od_threshold, boundary_tol=boundary_tol)
+    next_steps = {
+        "lack_of_fit": ("先不要用这个模型的最优点做决策：建议重新检查是否漏看了变量/交互，或尝试更高阶的模型，而不是直接推进到验证实验。", "warning"),
+        "boundary": ("建议先扩大测试范围，而不是直接安排验证批次——当前最优点很可能不是真正的最优，只是测试范围的边缘。", "warning"),
+        "od_infeasible": ("建议在产量和 OD600 可行性之间找折中点（参考「合并数据后的贝叶斯优化建议」），不要直接采用这个纯产量最优点。", "warning"),
+        "normal": ("模型和数据一致、最优点在测试范围内部且（若已检验）可行：建议安排 1-2 个验证批次，实测这个预测最优点附近的条件，确认与模型预测一致后再定为下一轮基准。", "success"),
+    }
+    next_step, severity = next_steps[case]
     verdicts.append(ResponseSurfaceVerdict(severity, f"下一步建议：{next_step}"))
 
     return verdicts

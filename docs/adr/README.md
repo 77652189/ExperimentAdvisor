@@ -15,3 +15,4 @@
 | [0011](0011-technical-noise-is-a-separate-diagnostic.md) | accepted | 技术重复噪声只作独立诊断展示，不并入现有显著性阈值。 |
 | [0012](0012-new-interval-level-stays-out-of-fixed-levels.md) | accepted | 新补料间隔水平(36h)通过专门交互子设计探索，不写入共享的 `FIXED_LEVELS`。 |
 | [0013](0013-ccd-response-surface-fit-design.md) | accepted | CCD 响应面拟合：全二次 OLS 模型、中心点估纯误差、最优点只搜已测范围。 |
+| [0014](0014-response-surface-deep-dive-four-analyses.md) | accepted | 响应面深入分析四件套：置信区间、灵敏度、鞍点/岭线判别、联合满意度，四种边界情况共用一个判据函数。 |
