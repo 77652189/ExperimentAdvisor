@@ -10,3 +10,11 @@ joblib>=1.3
 streamlit>=1.35
 plotly>=5.20
 scipy>=1.10
+
+# 跑测试需要（README 的验证步骤是 `python -m pytest -q`，之前照这个文件装完
+# 跑不了）。AppTest 端到端测试用的 streamlit.testing 随 streamlit 一起来，不是
+# 单独的包。
+pytest>=8.0
+
+# 上面全是无上界的 `>=`，不保证可复现。要装回一套已知能跑的确切版本，用
+# requirements.lock.txt（那里也写了为什么不该用 pip freeze 重新生成）。

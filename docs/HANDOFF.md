@@ -10,6 +10,21 @@ next_action: obtain_reviewed_round2_measurements
 
 Round 1 已用真实数据（菌株 Y103，16 个条件）完成回填与分析。基于这批数据生成的真实 Round 2 设计（响应面 CCD 18 点 + 补料间隔交互 2 点 + 噪声参考 2 点 + LHS 10 点，共 32 个条件）已经就位，等待摇瓶实验实际执行、产量与 OD600 回填。**负责搭建这套 Round 1/2 分析流程的同事已离职**，回填后的分析（CCD 响应面拟合、补料间隔交互检验、合并数据贝叶斯优化）需要接手人自己核对结果是否合理——这些分析逻辑用合成数据验证过正确性，但从未跑过真实 Round 2 数据。
 
+## ⚠️ 真实数据不在仓库里，要单独找人拿
+
+`.gitignore` 屏蔽了 `data/pichia/uploads/*` 和 `data/pichia/final/*`（ADR-0002，这是有意的：真实发酵数据不入版本控制）。后果是 clone 下来跑不出任何真实结论——**两个文件必须走内部渠道单独交接**：
+
+| 文件 | 内容 | 没有它的后果 |
+|---|---|---|
+| `data/pichia/uploads/2026-08-10-摇瓶发酵 round1-Y103.xlsx` | 真实 Round 1 原始数据（菌株 Y103，16 条件） | 无法从头复核回填过程 |
+| `data/pichia/final/pichia_run_level_dataset.csv` | 回填后的 run-level 数据集，**app 启动时读的就是它** | Round 1 页签是空的；Round 2 设计也生成不了（中心点和边界都来自 Round 1 的效应） |
+
+> **交接负责人请填**：这两个文件从 ____________ 获取（内部渠道 / 联系人）。
+
+注意 `python -m pytest -q` 全绿**不代表数据在位**——所有测试都自带合成数据（见「验证方式」），不会因为缺真实数据而失败。判断数据在不在位，看 `data/pichia/final/pichia_run_level_dataset.csv` 存不存在。
+
+Round 2 的合成测试数据**不需要交接**：界面「② 设计生成与回填」子页里内置了生成器（勾确认后点「填入模拟数据」，种子固定、只填空白格、不覆盖真实回填），只要 Round 1 数据在位，点两下就能让全部图表亮起来。
+
 ## 下一步
 
 Round 2 页签内部分成四个子页：**① 显著性分析 / ② 设计生成与回填 / ③ 响应面结果 / ④ 合并数据贝叶斯优化**。走法是先在②生成设计表、把实测结果填回去，③④才有内容（没数据时它们会提示指回②，不是空白页）。注意 `st.tabs` 不做懒加载——停在①时③的拟合照样在跑，分页解决的是导航，不是速度（见 `docs/adr/0017`）。
@@ -45,7 +60,13 @@ Pichia 页面在 `App/` 下分成这几个文件（见 `docs/adr/0017`，那里�
 
 ## 验证方式
 
-运行 `python -m pytest -q`；如改动 Streamlit 页面，再用 `streamlit run App/app.py` 检查默认 Pichia 页面、Round 1/2 导出回填与结果分析部分。这个开发环境里 Browser 预览面板经常无法渲染画面，验证 UI 改动时改用 `streamlit.testing.v1.AppTest` 驱动真实按钮点击（本次会话的脚本留在各自开发环境的临时目录，未提交到仓库）。
+运行 `python -m pytest -q`。其中 `tests/test_app_smoke.py` 是唯一驱动**整个 app** 的测试：用 `streamlit.testing.v1.AppTest` 点真实按钮走完 Round 2 全流程（生成设计 → 勾确认 → 填模拟数据 → 生成 BO 建议），断言四个子页存在、图表都渲染出来、全程无异常。其余测试都是直接调辅助函数，**它们全绿并不能说明页面打得开**——加 UI 功能时请顺手扩这个文件。
+
+它是自带数据的：Round 1 结果在测试里合成（K=3，和真实 Y103 的活跃变量数一致，才能覆盖 3D/等高线那些只在 K≥2 出现的图），两个落盘路径都 monkeypatch 到 `tmp_path`。所以**不依赖 `data/pichia/final/` 里的真实数据、也不会碰它**；新 clone 下来就能跑。
+
+改动 Streamlit 页面后仍建议 `streamlit run App/app.py` 人工看一眼观感——这个开发环境里 Browser 预览面板经常无法渲染画面，所以自动化验证只能靠上面那个 AppTest。
+
+依赖：`requirements.txt` 全是无上界的 `>=`，装最新版可能踩到破坏性变更。要装回一套已验证能跑的确切版本用 `requirements.lock.txt`（73 个包，含说明为什么不该用 `pip freeze` 重新生成）。
 
 ## 硬约束
 
