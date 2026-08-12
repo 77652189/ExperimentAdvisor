@@ -2209,6 +2209,8 @@ def _pichia_round2_results_analysis_section(plan: Round2Plan, round1_df: pd.Data
             st.warning("当前环境未安装 torch/botorch/gpytorch，无法运行贝叶斯优化建议。")
         except ValueError as exc:
             st.warning(f"未生成建议：{exc}")
+        except Exception as exc:
+            st.warning(f"贝叶斯优化建议生成失败（样本量很小时，GP 拟合可能数值不稳定）：{exc}")
         else:
             st.session_state["round2_combined_bo_result"] = bo_result
             st.success(
@@ -2372,6 +2374,8 @@ def _pichia_round2_tab() -> None:
             st.warning("当前环境未安装 torch/botorch/gpytorch，无法运行贝叶斯优化建议；以上响应面(CCD)部分不受影响。")
         except ValueError as exc:
             st.warning(f"未生成建议：{exc}")
+        except Exception as exc:
+            st.warning(f"贝叶斯优化建议生成失败（样本量很小时，GP 拟合可能数值不稳定）：{exc}")
         else:
             st.session_state["round2_bo_result"] = bo_result
             st.success(
