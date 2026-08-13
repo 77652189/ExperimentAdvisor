@@ -21,3 +21,5 @@
 | [0017](0017-pichia-ui-module-boundaries-and-round2-subtabs.md) | accepted | `pages_pichia.py` 拆成 6 个模块（三条边界有测试守着），Round 2 页签切四个子页；接受 `st.tabs` 不懒加载。 |
 | [0018](0018-round3-is-a-single-composite-confirmation-round.md) | accepted | Round 3 是一次性 32 瓶复合确认轮而非循环迭代；K 永久为 3；确认判据报两个不合并。方案见 `docs/ROUND3_PLAN.md`。 |
 | [0019](0019-fill-volume-cap-and-temperature-stay-fixed.md) | accepted | 装液量上限 75 mL 不放宽（250 mL 瓶已 30% 装液率）；温度因摇床是共享参数推迟到后期；溶氧探索移到发酵罐但须用配气而非降转速归因。 |
+| [0020](0020-ingest-time-normalisation-and-not-detected-as-zero.md) | accepted | 回填结果在读取阶段一次性规范化（单位换算、技术重复取均值且保留原始值）；「未检测到」按 0 而非缺失值，代价是低估真值。 |
+| [0021](0021-upr-collected-but-not-analysed.md) | accepted | UPR 采集入库但不进任何分析；搁置前提（方向未知）已因真实 Round 1 数据部分不成立，Round 2 后应重评为诊断维度。 |

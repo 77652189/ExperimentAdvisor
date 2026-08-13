@@ -42,6 +42,8 @@ def test_adr_index_and_records_are_present():
         "0017-pichia-ui-module-boundaries-and-round2-subtabs.md",
         "0018-round3-is-a-single-composite-confirmation-round.md",
         "0019-fill-volume-cap-and-temperature-stay-fixed.md",
+        "0020-ingest-time-normalisation-and-not-detected-as-zero.md",
+        "0021-upr-collected-but-not-analysed.md",
     }
 
 
