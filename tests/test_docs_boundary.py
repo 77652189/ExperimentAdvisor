@@ -41,6 +41,7 @@ def test_adr_index_and_records_are_present():
         "0016-remove-round1-only-bo-preview-and-history-tab.md",
         "0017-pichia-ui-module-boundaries-and-round2-subtabs.md",
         "0018-round3-is-a-single-composite-confirmation-round.md",
+        "0019-fill-volume-cap-and-temperature-stay-fixed.md",
     }
 
 

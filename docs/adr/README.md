@@ -20,3 +20,4 @@
 | [0016](0016-remove-round1-only-bo-preview-and-history-tab.md) | accepted | 删除脱节于 CCD 方法论的 Round1-only 贝叶斯优化预览批次，连带删除唯一依赖它的历史记录页签。 |
 | [0017](0017-pichia-ui-module-boundaries-and-round2-subtabs.md) | accepted | `pages_pichia.py` 拆成 6 个模块（三条边界有测试守着），Round 2 页签切四个子页；接受 `st.tabs` 不懒加载。 |
 | [0018](0018-round3-is-a-single-composite-confirmation-round.md) | accepted | Round 3 是一次性 32 瓶复合确认轮而非循环迭代；K 永久为 3；确认判据报两个不合并。方案见 `docs/ROUND3_PLAN.md`。 |
+| [0019](0019-fill-volume-cap-and-temperature-stay-fixed.md) | accepted | 装液量上限 75 mL 不放宽（250 mL 瓶已 30% 装液率）；温度因摇床是共享参数推迟到后期；溶氧探索移到发酵罐但须用配气而非降转速归因。 |
