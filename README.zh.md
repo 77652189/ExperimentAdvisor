@@ -14,10 +14,10 @@
 ![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=flat-square&logo=streamlit&logoColor=white)
 ![pytest](https://img.shields.io/badge/pytest-0A9EDC?style=flat-square&logo=pytest&logoColor=white)
 
-[![Status](https://img.shields.io/badge/状态-第一轮结果待回填-BA7517?style=flat-square)](#状态刻意的半成品)
+[![Status](https://img.shields.io/badge/状态-第二轮结果待回填-BA7517?style=flat-square)](#状态刻意的半成品)
 [![Sample](https://img.shields.io/badge/数据体制-18–40%20个训练点-0F766E?style=flat-square)](#受约束批次两个-gp一道过滤)
-[![ADRs](https://img.shields.io/badge/ADR-8%20条，条条配守卫测试-lightgrey?style=flat-square)](docs/adr/README.md)
-[![Tests](https://img.shields.io/badge/测试-55%20个-brightgreen?style=flat-square)](tests)
+[![ADRs](https://img.shields.io/badge/ADR-21%20条，条条配守卫测试-lightgrey?style=flat-square)](docs/adr/README.md)
+[![Tests](https://img.shields.io/badge/测试-154%20个-brightgreen?style=flat-square)](tests)
 
 [闭环](#闭环) · [为什么两条路线都留](#为什么两条路线都留着) · [方法要点](#方法要点) · [快速开始](#快速开始) · [技术栈](#技术栈) · [边界](#边界)
 
@@ -34,8 +34,13 @@
 
 ## 状态：刻意的半成品
 
-**第一批真实结果还没出来。** 这不是代码没写完——这类系统的价值本来就得等真实数据才能兑现，
-诚实的状态是"机制完整，等台面上的实验"。
+**第一轮已经跑在真实数据上了。** 16 个真实摇瓶条件（菌株 Y103，毕赤酵母 hLF）完成回填与显著性
+分析，三个变量判为活跃（`glucose_pct` / `ph` / `volume_ml`）；据此生成了真实的第二轮设计——32 个
+条件（18 点 CCD + 2 点补料间隔交互 + 2 点噪声参考 + 10 点 LHS），下载 / 回填 / 分析的闭环已完整。
+
+**没有发生的**是第二轮的台面实验。所以那条分析路径从未跑过真实的第二轮数字；仅用第一轮产量数据
+做留一法交叉验证，Q² 约 0.13——这是 16 个点能买到多少信息的真实反映，不是 bug。第三轮只有纸面
+设计（[`docs/ROUND3_PLAN.md`](docs/ROUND3_PLAN.md)、ADR-0018），一行代码都还没写。
 
 它走到这里的路径值得知道。最初的方案用的是历史大肠杆菌发酵罐数据，并且**在那上面完整跑通过
 一套贝叶斯流程**。但那批数据后来判定为**不可识别，而不只是稀疏**：菌种在很长的时间跨度里
@@ -159,7 +164,7 @@ python -m streamlit run App/app.py
 CPU 足够——模型天生就小，因为样本量就那么大。
 
 ```bash
-python -m pytest tests/     # 55 个测试
+python -m pytest tests/     # 154 个测试
 ```
 
 ## 技术栈
@@ -172,13 +177,14 @@ python -m pytest tests/     # 55 个测试
 | 设计生成 | 面心 CCD + 拉丁超立方 | 设计能被严格执行时用经典 DOE；LHS 用来低成本填充联合空间 |
 | 诊断 | scikit-learn + 留一 GP 交叉验证 | 作为模型可信度信息展示给用户，**不作为门槛** |
 | 界面 | Streamlit + Plotly | 单团队内部工具；旋钮**暴露出来**而不是替用户调好 |
-| 测试 | pytest | 55 个测试，其中几条守卫的是**决策**而不是行为 |
+| 测试 | pytest | 154 个测试，其中几条守卫的是**决策**而不是行为 |
 
 ## 边界
 
 - **六个变量、摇瓶、单一目标。** 不是通用发酵优化器。
 - **不预测产量，不声称找到最优条件。** 产出是"下一批做这几个点"。
-- **Round 1 不落地，Round 2 没有意义**——显著性步骤要求至少 5 行同时有产量与 OD600 的完整数据。
+- **上一轮不落地，下一轮没有意义**——显著性步骤要求至少 5 行同时有产量与 OD600 的完整数据。
+  Round 1 已落地；Round 2 的设计已生成但尚未实测，因此它下游的分析从未跑过真实数字。
 - **legacy 大肠杆菌发酵罐路径仅作参考**
   （[ADR-0003](docs/adr/0003-legacy-ecoli-fermenter-path-retained-as-reference.md)）；
   其历史 HMO/2FL 数据已作废，`App/pages_legacy_ecoli.py` 保留用于界面对照，不用于实际推荐。

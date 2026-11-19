@@ -14,10 +14,10 @@
 ![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=flat-square&logo=streamlit&logoColor=white)
 ![pytest](https://img.shields.io/badge/pytest-0A9EDC?style=flat-square&logo=pytest&logoColor=white)
 
-[![Status](https://img.shields.io/badge/status-round%201%20results%20pending-BA7517?style=flat-square)](#status-deliberately-half-finished)
+[![Status](https://img.shields.io/badge/status-round%202%20results%20pending-BA7517?style=flat-square)](#status-deliberately-half-finished)
 [![Sample](https://img.shields.io/badge/regime-18–40%20training%20points-0F766E?style=flat-square)](#the-constrained-batch-two-gps-one-filter)
-[![ADRs](https://img.shields.io/badge/ADRs-8%2C%20each%20with%20a%20guard%20test-lightgrey?style=flat-square)](docs/adr/README.md)
-[![Tests](https://img.shields.io/badge/tests-55-brightgreen?style=flat-square)](tests)
+[![ADRs](https://img.shields.io/badge/ADRs-21%2C%20each%20with%20a%20guard%20test-lightgrey?style=flat-square)](docs/adr/README.md)
+[![Tests](https://img.shields.io/badge/tests-154-brightgreen?style=flat-square)](tests)
 
 [The loop](#the-loop) · [Why both tracks](#why-both-tracks-exist) · [Method notes](#method-notes) · [Quick start](#quick-start) · [Tech stack](#tech-stack) · [Boundaries](#boundaries)
 
@@ -35,8 +35,16 @@ Small-sample design, not data mining. That constraint decides almost every choic
 
 ## Status: deliberately half-finished
 
-The first round of real results is not in yet. That is not unfinished code — a system like this
-only pays off against real data, and the honest state is "mechanism complete, waiting on the bench".
+Round 1 is done against real data. Sixteen real shake-flask conditions (strain Y103, *P. pastoris*
+hLF) were loaded back in, the significance step ran on them, and three variables came out active
+(`glucose_pct` / `ph` / `volume_ml`). From those results the tool generated a real Round 2 design —
+32 conditions: an 18-point CCD, 2 feed-interval interaction points, 2 noise references and a
+10-point LHS fill — and the download / backfill / analysis loop around it is complete.
+
+What has *not* happened is Round 2 on the bench. The analysis path has therefore never been run on
+real Round 2 numbers, and a leave-one-out Q² of about 0.13 on Round-1-only yield is an honest
+reading of how little 16 points buy — not a bug. Round 3 is designed on paper
+([`docs/ROUND3_PLAN.md`](docs/ROUND3_PLAN.md), ADR-0018) with no code written for it yet.
 
 It got here by a route worth knowing. The original plan used historical *E. coli* fermenter data,
 and a full Bayesian pipeline was built on it. That data turned out to be **unidentifiable rather
@@ -177,7 +185,7 @@ python -m streamlit run App/app.py
 CPU is fine — the models are small by construction, because the sample size is.
 
 ```bash
-python -m pytest tests/     # 55 tests
+python -m pytest tests/     # 154 tests
 ```
 
 ## Tech stack
@@ -190,14 +198,15 @@ python -m pytest tests/     # 55 tests
 | Design generation | Face-centered CCD + Latin hypercube | Classical DOE where the design can be executed exactly; LHS to fill the joint space cheaply |
 | Diagnostics | scikit-learn + leave-one-out GP CV | Shown to the user as model-trust information, not used as a gate |
 | UI | Streamlit + Plotly | Single-team internal tool; knobs are exposed rather than tuned away |
-| Tests | pytest | 55 tests, several of which guard **decisions** rather than behaviour |
+| Tests | pytest | 154 tests, several of which guard **decisions** rather than behaviour |
 
 ## Boundaries
 
 - **Six variables, shake flask, one target.** Not a general fermentation optimizer.
 - **No yield prediction, no claim of optimal conditions.** The output is "run these points next".
-- **Round 1 must land before Round 2 means anything** — the significance step needs at least five
-  complete rows with both yield and OD600.
+- **Each round must land before the next one means anything** — the significance step needs at least
+  five complete rows with both yield and OD600. Round 1 has landed; Round 2 is designed but unrun,
+  so nothing downstream of it has been exercised on real numbers.
 - **The legacy *E. coli* fermenter path is reference only**
   ([ADR-0003](docs/adr/0003-legacy-ecoli-fermenter-path-retained-as-reference.md)); its historical
   HMO/2FL data is void and `App/pages_legacy_ecoli.py` is kept for UI comparison, not for use.
